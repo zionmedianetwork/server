@@ -14,13 +14,13 @@ import (
 )
 
 type httpServer struct {
-	config *HTTP
+	config *HttpConfig
 	echo   *echo.Echo
 	server *http2.Server
 	logger logam.Logger
 }
 
-func NewHTTP(cfg *HTTP, log logam.Logger) (*httpServer, error) {
+func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 	var err error
 	if cfg == nil {
 		cfg, err = NewHttpConfig()

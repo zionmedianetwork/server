@@ -12,7 +12,7 @@ const (
 	defaultStaticPath   = "/static"
 )
 
-type HTTP struct {
+type HttpConfig struct {
 	BindAddress     string `split_words:"true" default:":8080"`
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
@@ -21,8 +21,8 @@ type HTTP struct {
 	AlllowedOrigins []string `split_words:"true" default:"*"`
 }
 
-func NewHttpConfig() (*HTTP, error) {
-	var h HTTP
+func NewHttpConfig() (*HttpConfig, error) {
+	var h HttpConfig
 	if err := envconfig.Process("http", &h); err != nil {
 		return nil, err
 	}
