@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
-	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -158,20 +160,89 @@ func (s httpServer) Echo() *echo.Echo {
 	return s.echo
 }
 
-func (s httpServer) Run() {
+// Run starts the server and blocks until the process is asked to terminate
+// with SIGINT or SIGTERM, then drains in-flight requests before returning.
+//
+// Run returns nil when the drain completes within the configured grace
+// period. It returns a non-nil error when the server never got as far as
+// serving — a failed bind being the usual case — or when the drain overruns
+// that grace period and in-flight requests were cut off.
+//
+// The returned error is the only report Run makes: nothing is logged on the
+// caller's behalf, so the failure is described once, by whoever owns the
+// process, with whatever severity and context that owner considers right.
+//
+// Run never terminates the calling process. Deciding that a failure to serve
+// warrants a non-zero exit status belongs to the application, not to this
+// package; a caller that discards the returned error is choosing to keep
+// running, and gets no diagnostics for that choice.
+func (s httpServer) Run() error {
+	// Register the signal handlers before anything starts listening. A signal
+	// that races with startup is then caught by this handler instead of
+	// falling through to Go's default action, which is to kill the process.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	return s.run(ctx, stop)
+}
+
+// run serves until ctx is cancelled and then drains. It is the testable core
+// of Run: the caller owns the signal wiring, so a test can drive the whole
+// shutdown path with a plain context.
+//
+// stop is called the moment the drain starts. That deregisters the signal
+// handlers and restores the default disposition, so a second SIGINT or
+// SIGTERM aborts a drain that is not making progress instead of being
+// swallowed — the familiar "press Ctrl-C again to force quit" behaviour, and
+// the same escalation path a runtime takes before it resorts to SIGKILL.
+func (s httpServer) run(ctx context.Context, stop func()) error {
+	serveErr := make(chan error, 1)
 	go func() {
-		s.logger.Fatal(s.echo.StartH2CServer(s.config.BindAddress, s.server))
+		serveErr <- s.serve()
 	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
-	<-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := s.echo.Shutdown(ctx); err != nil {
-		s.logger.Fatal(err)
+	select {
+	case err := <-serveErr:
+		// The server stopped on its own before any shutdown was requested, so
+		// there is nothing to drain. This is the genuine startup failure path.
+		return err
+	case <-ctx.Done():
 	}
 
+	stop()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout())
+	defer cancel()
+
+	if err := s.echo.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown http server: %w", err)
+	}
+
+	// Shutdown has returned, so the serve goroutine is done or about to be.
+	// Collecting its result keeps it from outliving Run.
+	return <-serveErr
+}
+
+// serve runs the listener and normalises its result. http.ErrServerClosed is
+// how the standard library reports "Shutdown was called" — a success signal,
+// not a failure — so it must not be propagated.
+func (s httpServer) serve() error {
+	err := s.echo.StartH2CServer(s.config.BindAddress, s.server)
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return fmt.Errorf("serve http on %s: %w", s.config.BindAddress, err)
+}
+
+// shutdownTimeout is the grace period given to in-flight requests. A
+// non-positive value means the config was built by hand without one, and
+// using it as-is would expire the context immediately and sever every live
+// request, so fall back to the package default.
+func (s httpServer) shutdownTimeout() time.Duration {
+	if s.config.ShutdownTimeout <= 0 {
+		return defaultShutdownTimeout
+	}
+	return s.config.ShutdownTimeout
 }
 
 func ok(ctx echo.Context) error {
