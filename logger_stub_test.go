@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/zionmedianetwork/logam"
@@ -12,6 +13,10 @@ type logLevel string
 const (
 	levelInfo  logLevel = "info"
 	levelError logLevel = "error"
+	// levelFatal records calls the real logam logger would answer by calling
+	// os.Exit(1). The stub records them instead so a test can assert the
+	// process would have survived.
+	levelFatal logLevel = "fatal"
 )
 
 // logEntry is a single structured call recorded by stubLogger.
@@ -59,6 +64,17 @@ func (l *stubLogger) recorded() []logEntry {
 	return append([]logEntry(nil), l.entries...)
 }
 
+// entriesAt returns every entry recorded at the given level.
+func (l *stubLogger) entriesAt(level logLevel) []logEntry {
+	var matched []logEntry
+	for _, e := range l.recorded() {
+		if e.level == level {
+			matched = append(matched, e)
+		}
+	}
+	return matched
+}
+
 func (l *stubLogger) Infow(msg string, keysAndValues ...interface{}) {
 	l.record(levelInfo, msg, keysAndValues...)
 }
@@ -70,10 +86,19 @@ func (l *stubLogger) Errorw(msg string, keysAndValues ...interface{}) {
 func (l *stubLogger) Warnw(msg string, keysAndValues ...interface{})  {}
 func (l *stubLogger) Debugw(msg string, keysAndValues ...interface{}) {}
 
+// Fatal and Fatalf are recorded rather than ignored: the real logam logger
+// exits the process here, so a recorded entry is proof the process would have
+// died.
+func (l *stubLogger) Fatal(args ...interface{}) {
+	l.record(levelFatal, fmt.Sprint(args...))
+}
+
+func (l *stubLogger) Fatalf(format string, args ...interface{}) {
+	l.record(levelFatal, fmt.Sprintf(format, args...))
+}
+
 func (l *stubLogger) Errorf(format string, args ...interface{}) {}
 func (l *stubLogger) Error(args ...interface{})                 {}
-func (l *stubLogger) Fatalf(format string, args ...interface{}) {}
-func (l *stubLogger) Fatal(args ...interface{})                 {}
 func (l *stubLogger) Infof(format string, args ...interface{})  {}
 func (l *stubLogger) Info(args ...interface{})                  {}
 func (l *stubLogger) Warnf(format string, args ...interface{})  {}
