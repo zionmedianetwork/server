@@ -13,6 +13,15 @@ import (
 	"golang.org/x/net/http2"
 )
 
+const (
+	healthzPath   = "/healthz"
+	v1HealthzPath = "/v1/healthz"
+
+	// requestLogMessage is the message every access log entry carries; the
+	// detail lives in the structured fields.
+	requestLogMessage = "request"
+)
+
 type httpServer struct {
 	config *HttpConfig
 	echo   *echo.Echo
@@ -43,9 +52,7 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 	e.Pre(middleware.RequestID())
 	e.Use(middleware.BodyLimit(cfg.MaxBodyLimit))
 	e.Use(middleware.Recover())
-	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
-		Format: "method=${method}, status=${status},  path=${path}, remote=${remote_host}, latency=${latency_human}\n",
-	}))
+	e.Use(requestLogger(log))
 
 	// Static content
 	e.Static("/static", "static")
@@ -70,8 +77,8 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 	e.Server.WriteTimeout = cfg.WriteTimeout
 
 	// Health check routes
-	e.GET("/healthz", ok)
-	e.GET("/v1/healthz", ok)
+	e.GET(healthzPath, ok)
+	e.GET(v1HealthzPath, ok)
 
 	s.server = &http2.Server{
 		MaxConcurrentStreams: 200,
@@ -80,6 +87,71 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 	}
 
 	return s, nil
+}
+
+// healthCheckPaths holds the route paths that are excluded from request
+// logging. Probe traffic is high volume and carries no information, so logging
+// it only drowns out real requests.
+var healthCheckPaths = map[string]struct{}{
+	healthzPath:   {},
+	v1HealthzPath: {},
+}
+
+// skipRequestLog reports whether the request logger should ignore this request.
+// It matches on the routed path so that query strings never affect the decision.
+func skipRequestLog(c echo.Context) bool {
+	path := c.Path()
+	if path == "" {
+		path = c.Request().URL.Path
+	}
+	_, skipped := healthCheckPaths[path]
+	return skipped
+}
+
+// requestLogger builds the access log middleware. It emits one structured entry
+// per request through the injected logam logger, at error level when the handler
+// chain failed or answered with a server error, and at info level otherwise.
+func requestLogger(log logam.Logger) echo.MiddlewareFunc {
+	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+		Skipper: skipRequestLog,
+		// Let the global error handler run before the values are read, so the
+		// logged status and response size are the ones the client actually got
+		// rather than the still-untouched defaults.
+		HandleError:     true,
+		LogRequestID:    true,
+		LogRemoteIP:     true,
+		LogMethod:       true,
+		LogURI:          true,
+		LogURIPath:      true,
+		LogStatus:       true,
+		LogLatency:      true,
+		LogError:        true,
+		LogResponseSize: true,
+		LogValuesFunc: func(_ echo.Context, v middleware.RequestLoggerValues) error {
+			fields := []interface{}{
+				"request_id", v.RequestID,
+				"method", v.Method,
+				"path", v.URIPath,
+				"uri", v.URI,
+				"status", v.Status,
+				"remote_ip", v.RemoteIP,
+				"latency", v.Latency.String(),
+				"bytes_out", v.ResponseSize,
+			}
+
+			if v.Error != nil {
+				fields = append(fields, "error", v.Error.Error())
+			}
+
+			if v.Error != nil || v.Status >= http.StatusInternalServerError {
+				log.Errorw(requestLogMessage, fields...)
+				return nil
+			}
+
+			log.Infow(requestLogMessage, fields...)
+			return nil
+		},
+	})
 }
 
 func (s httpServer) Echo() *echo.Echo {
