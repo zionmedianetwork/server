@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -311,9 +313,23 @@ func TestLivenessStaysOKWhileReadinessFails(t *testing.T) {
 	}
 }
 
-// TestRequestLoggerSkipsReadinessPaths keeps probe traffic out of the log for
-// the same reason the liveness paths are skipped, and more so: readiness is
-// polled by every load balancer that fronts the instance.
+// wantNoAccessLog asserts the request logger stayed out of a probe. It is
+// specifically about the access log rather than about the log being empty,
+// because a failing readiness check does log — deliberately, since the body
+// withholds the cause.
+func wantNoAccessLog(t *testing.T, log *stubLogger) {
+	t.Helper()
+
+	for _, e := range log.recorded() {
+		if e.msg == requestLogMessage {
+			t.Errorf("readiness probe produced an access log entry: %+v", e)
+		}
+	}
+}
+
+// TestRequestLoggerSkipsReadinessPaths keeps probe traffic out of the access
+// log for the same reason the liveness paths are skipped, and more so:
+// readiness is polled by every load balancer that fronts the instance.
 func TestRequestLoggerSkipsReadinessPaths(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -328,16 +344,321 @@ func TestRequestLoggerSkipsReadinessPaths(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, log := newTestServer(t)
-			// A failing check answers 503, which is the status the logger
+			// A failing check answers 503, which is the status the access log
 			// would otherwise be most eager to record.
 			register(t, s, "postgres", failingCheck)
 
 			do(t, s, httptest.NewRequest(http.MethodGet, tt.target, nil))
 
-			if entries := log.recorded(); len(entries) != 0 {
-				t.Errorf("logged %d entries for a readiness probe, want 0: %+v", len(entries), entries)
+			wantNoAccessLog(t, log)
+			// The one entry a failing probe does produce is the readiness
+			// warning, which is where the cause lives now that it is kept out
+			// of the body.
+			if entries := log.entriesAt(levelWarn); len(entries) != 1 {
+				t.Errorf("logged %d warn entries, want exactly the readiness failure: %+v", len(entries), entries)
 			}
 		})
+	}
+}
+
+// TestPassingReadinessProbeLogsNothing is the volume floor. /readyz is polled
+// continuously, so a healthy instance must be silent: one line per probe, or
+// per passing check per probe, would flood the log exactly as the access log
+// entries these paths were excluded from.
+func TestPassingReadinessProbeLogsNothing(t *testing.T) {
+	s, log := newTestServer(t)
+	register(t, s, "postgres", passingCheck)
+	register(t, s, "cache", passingCheck)
+
+	for i := 0; i < 5; i++ {
+		if rec := probeReadiness(t, s, readyzPath); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	}
+
+	if entries := log.recorded(); len(entries) != 0 {
+		t.Errorf("logged %d entries for passing probes, want 0: %+v", len(entries), entries)
+	}
+}
+
+// onlyWarn asserts exactly one warn entry was logged and returns it.
+func onlyWarn(t *testing.T, log *stubLogger) logEntry {
+	t.Helper()
+
+	entries := log.entriesAt(levelWarn)
+	if len(entries) != 1 {
+		t.Fatalf("logged %d warn entries, want exactly 1: %+v", len(entries), entries)
+	}
+	return entries[0]
+}
+
+// TestReadinessFailureIsLoggedInBothDebugModes closes the gap that withholding
+// the cause from the body opens. The readiness paths are out of the access log,
+// so without this entry a failing check would leave no trace anywhere: an
+// operator would see {"status":"fail","checks":[{"name":"postgres",...}]} and
+// have no way to learn why short of redeploying with HTTP_DEBUG on, which is to
+// say reintroducing the leak in order to diagnose it. The log entry is where
+// the cause goes, in both settings, because the log is readable by operators
+// and not by whoever reached the endpoint.
+func TestReadinessFailureIsLoggedInBothDebugModes(t *testing.T) {
+	for _, debug := range []bool{false, true} {
+		name := "debug off"
+		if debug {
+			name = "debug on"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Debug = debug
+
+			s, log := newTestServerWith(t, cfg)
+			register(t, s, "postgres", failingCheck)
+
+			if rec := probeReadiness(t, s, readyzPath); rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+			}
+
+			entry := onlyWarn(t, log)
+			if entry.msg != readinessFailedMessage {
+				t.Errorf("message = %q, want %q", entry.msg, readinessFailedMessage)
+			}
+			wantField(t, entry, "check", "postgres")
+			wantField(t, entry, "error", dsnError.Error())
+
+			// One line, not two: Debug adds the cause to the body, it does not
+			// add a second entry to the log.
+			if entries := log.recorded(); len(entries) != 1 {
+				t.Errorf("logged %d entries, want exactly 1: %+v", len(entries), entries)
+			}
+		})
+	}
+}
+
+// TestReadinessFailureIsLoggedAtWarn pins the level. A dependency going away is
+// expected and usually self-healing, and this process answers it correctly by
+// standing down from the load balancer; error level in this package means a
+// caller's request was damaged, and spending it on routine dependency churn is
+// how a team learns to filter error.
+func TestReadinessFailureIsLoggedAtWarn(t *testing.T) {
+	s, log := newTestServer(t)
+	register(t, s, "postgres", failingCheck)
+
+	probeReadiness(t, s, readyzPath)
+
+	if entries := log.entriesAt(levelError); len(entries) != 0 {
+		t.Errorf("logged %d error entries for a failing dependency, want them at warn: %+v", len(entries), entries)
+	}
+	if entries := log.entriesAt(levelWarn); len(entries) != 1 {
+		t.Errorf("logged %d warn entries, want 1: %+v", len(entries), entries)
+	}
+}
+
+// TestReadinessFailureIsLoggedOncePerInterval is the volume control seen from
+// the handler. A load balancer polling once a second would otherwise turn an
+// hour-long outage into thousands of identical lines per pod.
+func TestReadinessFailureIsLoggedOncePerInterval(t *testing.T) {
+	s, log := newTestServer(t)
+	register(t, s, "postgres", failingCheck)
+
+	for i := 0; i < 10; i++ {
+		if rec := probeReadiness(t, s, readyzPath); rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want %d on probe %d", rec.Code, http.StatusServiceUnavailable, i)
+		}
+	}
+
+	// The status is reported on every probe; only the log is deduplicated.
+	entry := onlyWarn(t, log)
+	wantField(t, entry, "check", "postgres")
+}
+
+// TestReadinessLogsRecovery closes the incident. A transition-based log with no
+// closing line leaves an operator to work out from silence whether a dependency
+// came back or the probe stopped running.
+func TestReadinessLogsRecovery(t *testing.T) {
+	s, log := newTestServer(t)
+
+	var down atomic.Bool
+	down.Store(true)
+	register(t, s, "postgres", func(context.Context) error {
+		if down.Load() {
+			return dsnError
+		}
+		return nil
+	})
+
+	if rec := probeReadiness(t, s, readyzPath); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d while the dependency is down", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	down.Store(false)
+	for i := 0; i < 3; i++ {
+		if rec := probeReadiness(t, s, readyzPath); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d once the dependency is back", rec.Code, http.StatusOK)
+		}
+	}
+
+	recovered := log.entriesAt(levelInfo)
+	if len(recovered) != 1 {
+		t.Fatalf("logged %d info entries, want exactly one recovery: %+v", len(recovered), recovered)
+	}
+	if recovered[0].msg != readinessRecoveredMessage {
+		t.Errorf("message = %q, want %q", recovered[0].msg, readinessRecoveredMessage)
+	}
+	wantField(t, recovered[0], "check", "postgres")
+
+	// The recovery is not itself a leak: it names the check that came back,
+	// not what was wrong with it.
+	if _, ok := recovered[0].field("error"); ok {
+		t.Errorf("recovery entry carries an error field: %+v", recovered[0].fields)
+	}
+}
+
+// TestReadinessFailureLoggingIsRaceFree covers the state the volume control
+// added. Probes arrive concurrently — several load balancers, several
+// orchestrator components — and the once-per-interval decision has to be made
+// once rather than by each of them in parallel. Run under -race this also
+// covers the map itself.
+func TestReadinessFailureLoggingIsRaceFree(t *testing.T) {
+	const probes = 16
+
+	s, log := newTestServer(t)
+	register(t, s, "postgres", failingCheck)
+
+	var wg sync.WaitGroup
+	wg.Add(probes)
+	for i := 0; i < probes; i++ {
+		go func() {
+			defer wg.Done()
+
+			rec := httptest.NewRecorder()
+			s.Echo().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, readyzPath, nil))
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Without the lock around the decision, concurrent probes would each find
+	// the check unreported and log it.
+	if entries := log.entriesAt(levelWarn); len(entries) != 1 {
+		t.Errorf("logged %d warn entries for %d concurrent probes, want exactly 1: %+v", len(entries), probes, entries)
+	}
+}
+
+// TestFailureLogNotices drives the decision directly at explicit points in
+// time, which is the only way to cover the repeat without making a test wait a
+// minute for it.
+func TestFailureLogNotices(t *testing.T) {
+	failing := []outcome{{name: "postgres", err: dsnError}}
+	passing := []outcome{{name: "postgres"}}
+
+	var log failureLog
+	start := time.Now()
+
+	// The transition is reported the moment it is seen.
+	notices := log.notices(start, failing)
+	if len(notices) != 1 {
+		t.Fatalf("first failure produced %d notices, want 1: %+v", len(notices), notices)
+	}
+	if notices[0].err == nil {
+		t.Error("first notice has no error, want the failure")
+	}
+	if notices[0].failingFor != 0 {
+		t.Errorf("first notice failing_for = %s, want 0", notices[0].failingFor)
+	}
+
+	// Everything inside the interval is silent, however many probes arrive.
+	for _, at := range []time.Duration{time.Second, 30 * time.Second, readinessLogInterval - time.Millisecond} {
+		if notices := log.notices(start.Add(at), failing); len(notices) != 0 {
+			t.Errorf("failure repeated after %s, want silence until %s: %+v", at, readinessLogInterval, notices)
+		}
+	}
+
+	// At the interval it is mentioned again, carrying how long it has been down
+	// so the repeat explains itself.
+	notices = log.notices(start.Add(readinessLogInterval), failing)
+	if len(notices) != 1 {
+		t.Fatalf("failure produced %d notices at the interval, want 1: %+v", len(notices), notices)
+	}
+	if notices[0].failingFor != readinessLogInterval {
+		t.Errorf("repeat failing_for = %s, want %s", notices[0].failingFor, readinessLogInterval)
+	}
+
+	// The clock for the next repeat runs from the last line, not from the
+	// first failure.
+	if notices := log.notices(start.Add(readinessLogInterval+time.Second), failing); len(notices) != 0 {
+		t.Errorf("failure repeated a second late, want silence: %+v", notices)
+	}
+
+	// Recovery is reported once, with the total time down and no error.
+	recovery := start.Add(2 * readinessLogInterval)
+	notices = log.notices(recovery, passing)
+	if len(notices) != 1 {
+		t.Fatalf("recovery produced %d notices, want 1: %+v", len(notices), notices)
+	}
+	if notices[0].err != nil {
+		t.Errorf("recovery notice carries an error: %v", notices[0].err)
+	}
+	if want := recovery.Sub(start); notices[0].failingFor != want {
+		t.Errorf("recovery failing_for = %s, want %s", notices[0].failingFor, want)
+	}
+
+	// And a check that is simply passing says nothing at all.
+	if notices := log.notices(recovery.Add(time.Second), passing); len(notices) != 0 {
+		t.Errorf("passing check produced notices, want silence: %+v", notices)
+	}
+
+	// A dependency that fails again after recovering is a new incident, and is
+	// reported immediately rather than being suppressed by the old timer.
+	notices = log.notices(recovery.Add(2*time.Second), failing)
+	if len(notices) != 1 {
+		t.Fatalf("second incident produced %d notices, want 1: %+v", len(notices), notices)
+	}
+	if notices[0].failingFor != 0 {
+		t.Errorf("second incident failing_for = %s, want it to start from zero", notices[0].failingFor)
+	}
+}
+
+// TestFailureLogTracksChecksIndependently keeps one noisy dependency from
+// silencing another: the interval is per check, not per probe.
+func TestFailureLogTracksChecksIndependently(t *testing.T) {
+	var log failureLog
+	start := time.Now()
+
+	if notices := log.notices(start, []outcome{{name: "postgres", err: dsnError}}); len(notices) != 1 {
+		t.Fatalf("postgres failure produced %d notices, want 1", len(notices))
+	}
+
+	// A second dependency fails inside postgres's quiet window and must still
+	// be reported.
+	notices := log.notices(start.Add(time.Second), []outcome{
+		{name: "postgres", err: dsnError},
+		{name: "cache", err: errors.New("dial tcp 10.0.0.9:6379: connect: connection refused")},
+	})
+	if len(notices) != 1 {
+		t.Fatalf("produced %d notices, want just the new failure: %+v", len(notices), notices)
+	}
+	if notices[0].name != "cache" {
+		t.Errorf("notice names %q, want the newly failing check", notices[0].name)
+	}
+}
+
+// TestFailureLogForgetsRecoveredChecks keeps the state bounded: it tracks
+// broken dependencies, not every check ever registered, so a long-lived
+// process does not accumulate an entry per name for the life of the pod.
+func TestFailureLogForgetsRecoveredChecks(t *testing.T) {
+	var log failureLog
+	now := time.Now()
+
+	log.notices(now, []outcome{{name: "postgres", err: dsnError}})
+	if len(log.failing) != 1 {
+		t.Fatalf("tracking %d checks while one is down, want 1", len(log.failing))
+	}
+
+	log.notices(now.Add(time.Second), []outcome{{name: "postgres"}})
+	if len(log.failing) != 0 {
+		t.Errorf("tracking %d checks after recovery, want none: %+v", len(log.failing), log.failing)
 	}
 }
 
