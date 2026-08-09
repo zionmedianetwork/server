@@ -1,0 +1,213 @@
+name: CI
+
+# Every check below is one that has been run by hand on each branch so far.
+# The point of this file is that nobody has to remember to.
+on:
+  # Pushes to main cover merges and any direct commit. Branch pushes are not
+  # built here on purpose: a branch with an open PR would otherwise build the
+  # same commit twice, once for the push and once for the PR. Widen this to
+  # `branches: ["**"]` if pre-PR feedback matters more than the duplicate runs.
+  push:
+    branches: [main]
+  pull_request:
+
+# The workflow only reads the repository. Nothing here deploys, publishes or
+# comments, so nothing here needs write access to anything.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The Go version is written out in each job rather than held in a workflow-level
+# env var. It is three literals instead of one, but it needs no expression to be
+# resolved, and the failure mode of an expression that does not resolve here is
+# silent: setup-go would fall back to whatever Go the runner image ships and the
+# pin would stop meaning anything without anything turning red.
+#
+# "1.23.x" matches the `go 1.23.3` directive in go.mod. The `.x` takes the newest
+# patch of that line rather than 1.23.3 exactly: a later patch of the same minor
+# is already what the go directive permits, and it carries the toolchain's own
+# security fixes.
+jobs:
+  build:
+    name: build / vet / gofmt / test
+    # ubuntu-latest, and this is not arbitrary. shutdown_signal_test.go is
+    # //go:build unix and delivers a real SIGTERM and SIGINT to the test
+    # process with syscall.Kill. On Linux that tag is satisfied and those tests
+    # run; on windows-latest the whole file is excluded from the build, so the
+    # SIGTERM handling that PR #2 exists to fix would go untested and CI would
+    # still be green — a silent gap, which is the worst kind. Linux also has
+    # first-class support for the race detector used below.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.23.x"
+          # Resolve 1.23.x against go.dev rather than settling for whatever
+          # 1.23 patch the runner image happens to have cached.
+          check-latest: true
+          # Module and build caching, keyed on go.sum. On by default in this
+          # major version; stated explicitly so a default change is visible.
+          cache: true
+
+      - name: Report toolchain
+        run: go version
+
+      # This repository has lost go.sum before (commits 3c6e11c, 64bf61b), and
+      # a missing go.sum means every clone resolves its own dependency hashes:
+      # the build stops being reproducible and stops being verifiable. Checking
+      # the file is tracked catches the deletion directly; a build failure
+      # would only catch it indirectly, and `go mod tidy` further down would
+      # quietly recreate the file and hide it.
+      - name: go.sum is committed
+        run: git ls-files --error-unmatch go.sum
+
+      # Run before anything else touches the module files, so the comparison is
+      # against the checkout as committed. `go mod tidy` also downloads
+      # everything the build needs, so this doubles as the download step.
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod/go.sum are not tidy. Run 'go mod tidy' and commit the diff above."
+            exit 1
+          fi
+
+      # Checks the contents of every module in the build against the hashes in
+      # go.sum: the dependency you get is the dependency that was reviewed.
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # gofmt -l prints the names of unformatted files and exits 0 either way,
+      # so `run: gofmt -l .` would pass on a repository full of unformatted
+      # code. The output has to be tested, not the exit status.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt: these files are not formatted. Run 'gofmt -w .'"
+            echo "$unformatted"
+            # Print the diff too, so the fix is visible without a local run.
+            gofmt -d .
+            exit 1
+          fi
+
+      # -count=1 defeats the test result cache. The cache is keyed on inputs
+      # the runner cannot fully see (env, files read at runtime), and a cached
+      # PASS is not evidence.
+      - name: Test
+        run: go test -count=1 ./...
+
+      # Run separately rather than instead of the plain run: -race changes
+      # scheduling and timing, and this package's shutdown, timeout and
+      # readiness tests are concurrent and time-sensitive. A failure that
+      # appears only here is a real signal, and keeping both makes it obvious
+      # which one that is.
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.23.x"
+          check-latest: true
+          cache: true
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned rather than `latest`. A linter that updates itself turns
+          # unrelated pull requests red on somebody else's schedule; bump this
+          # deliberately, as its own change, with the new findings reviewed.
+          version: v2.12.2
+          # The linter set and its exclusions live in .golangci.yml, next to
+          # the reasoning for each one.
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.23.x"
+          check-latest: true
+          cache: true
+
+      # This step fails the job only when a vulnerable symbol is reachable from
+      # this package's own call graph — govulncheck exits 3 for that case and 0
+      # when the vulnerability merely exists somewhere in the module graph.
+      # That is the behaviour we want, and it is why nothing extra is wired up
+      # here:
+      #
+      #   - Reachable means this code calls it. It is actionable now, it is
+      #     rare, and it should stop a merge.
+      #   - Not reachable means the CVE is in a dependency function nothing
+      #     here calls. Today that describes 32 findings, most of them in
+      #     golang.org/x/crypto/ssh, which this package has no use for. Failing
+      #     on those would leave CI red for weeks on work no one can do from
+      #     this repository, and a permanently red gate is an ignored gate.
+      #
+      # The non-reachable findings are still printed (-show verbose) so they
+      # are visible in the log and can be triaged deliberately.
+      #
+      # GOTOOLCHAIN=auto is required and is not incidental. setup-go pins
+      # GOTOOLCHAIN=local so a build cannot silently use a Go other than the
+      # pinned one, but govulncheck@latest declares go >= 1.25.0 and so cannot
+      # be built by the 1.23.x toolchain at all: with local pinning the step
+      # fails outright rather than running. Allowing the switch here scopes the
+      # newer toolchain to govulncheck's own build; the build job keeps its pin.
+      - name: govulncheck (dependencies)
+        env:
+          GOTOOLCHAIN: auto
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest -show verbose ./...
+
+      # The step above analyses the standard library of the toolchain it ran
+      # under, which is the newer one it just switched to — NOT the go1.23.x
+      # this module targets. So it reports the dependency graph accurately and
+      # says nothing useful about the standard library anyone actually builds
+      # against here.
+      #
+      # This step closes that gap: an older govulncheck that the pinned 1.23.x
+      # can build, run with the toolchain pinned, so the standard library under
+      # analysis is the one in go.mod. It currently reports 24 REACHABLE
+      # vulnerabilities with call traces into this package, e.g. crypto/x509
+      # via StartH2CServer. Every one is fixed in a later Go: 4 within the 1.23
+      # line, 11 in 1.24, 9 in 1.25.
+      #
+      # It is continue-on-error precisely because those 24 cannot be fixed from
+      # this repository — they are fixed by building with a newer Go, which is
+      # a consumer-visible release decision, not a change to this module. A
+      # blocking step here would be red on day one and stay red, and an
+      # always-red gate teaches everyone to ignore the job. Warning keeps the
+      # exposure in the log where the decision can be made from evidence.
+      #
+      # Note that stdlib exposure follows the toolchain that BUILDS a binary,
+      # not go.mod's `go` directive, which is a floor. A consumer already
+      # building with Go 1.25 is unaffected by this list today.
+      #
+      # Remove this step once the module moves off Go 1.23: at that point the
+      # build toolchain and govulncheck's own requirement converge and the
+      # first step covers the standard library on its own.
+      - name: govulncheck (standard library of the pinned toolchain)
+        continue-on-error: true
+        env:
+          GOTOOLCHAIN: local
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
