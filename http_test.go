@@ -18,12 +18,15 @@ const testRemoteIP = "192.0.2.1"
 // changes that field rather than restating the whole config.
 func testConfig() *HttpConfig {
 	return &HttpConfig{
-		BindAddress:     ":0",
-		ReadTimeout:     time.Second,
-		WriteTimeout:    time.Second,
-		MaxBodyLimit:    "1M",
-		StaticPath:      defaultStaticPath,
-		AlllowedOrigins: []string{"*"},
+		BindAddress:  ":0",
+		ReadTimeout:  time.Second,
+		WriteTimeout: time.Second,
+		MaxBodyLimit: "1M",
+		StaticPath:   defaultStaticPath,
+		// No origins, which is the shipped default: the suite runs against the
+		// CORS posture a deployment that sets nothing actually gets. The tests
+		// that need cross-origin access name the origins they need.
+		AlllowedOrigins: nil,
 		RealIPSource:    RealIPSourcePeer,
 	}
 }

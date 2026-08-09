@@ -25,6 +25,38 @@ const (
 	// requestLogMessage is the message every access log entry carries; the
 	// detail lives in the structured fields.
 	requestLogMessage = "request"
+
+	// The baseline security header values. They are set on every response
+	// unless HTTP_DISABLE_SECURITY_HEADERS says otherwise.
+	//
+	// nosniff stops a browser second-guessing a Content-Type, which is how a
+	// JSON or upload endpoint ends up executing as script.
+	//
+	// SAMEORIGIN rather than DENY: this package serves a static route from the
+	// same origin, and DENY would break an embed the same deployment owns while
+	// adding nothing against the cross-origin framing SAMEORIGIN already
+	// refuses.
+	//
+	// strict-origin-when-cross-origin keeps the full URL for same-origin
+	// navigation, sends only the origin to another site, and sends nothing at
+	// all on a downgrade. The paths this package carries name resources —
+	// /v1/videos/42 — and a Referer is how those ids reach an analytics script
+	// somebody else operates.
+	//
+	// X-XSS-Protection is set to 0, which is not a typo and not the echo
+	// default. The legacy XSS auditor it enables was itself exploitable and has
+	// been removed from every current browser; 0 is the value the OWASP secure
+	// headers project now recommends, and it is sent rather than omitted so that
+	// a browser still carrying the auditor does not turn it on by itself.
+	secureContentTypeOptions = "nosniff"
+	secureFrameOptions       = "SAMEORIGIN"
+	secureReferrerPolicy     = "strict-origin-when-cross-origin"
+	secureXSSProtection      = "0"
+
+	// gzipMinLength is the smallest response worth compressing. Below roughly a
+	// kilobyte the gzip framing costs more than the compression saves, and both
+	// ends pay CPU for a response that came out larger.
+	gzipMinLength = 1024
 )
 
 type httpServer struct {
@@ -77,6 +109,26 @@ func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
 		return nil, err
 	}
 
+	allowedOrigins, err := cfg.allowedOrigins()
+	if err != nil {
+		return nil, err
+	}
+
+	corsMaxAge, err := cfg.corsMaxAge()
+	if err != nil {
+		return nil, err
+	}
+
+	hstsMaxAge, err := cfg.hstsMaxAge()
+	if err != nil {
+		return nil, err
+	}
+
+	rateLimit, err := cfg.rateLimit()
+	if err != nil {
+		return nil, err
+	}
+
 	// Instantiate a new echo
 	e := echo.New()
 
@@ -93,27 +145,66 @@ func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
 	// rate limit built on top — would report whatever the caller asked for.
 	e.IPExtractor = ipExtractor
 
-	// Set some useful middlewares
+	// Set some useful middlewares. The order below is the whole design of the
+	// chain: the first Use is the outermost wrapper and the last one sits
+	// closest to the handler, so what is registered early sees every response
+	// the ones after it produce, including their rejections.
 	e.Pre(middleware.RemoveTrailingSlash())
 	e.Pre(middleware.RequestID())
+
+	// Baseline response headers, outermost of all, because a rejection is a
+	// response too: a 413 from the body limit, a 429 from the rate limiter and
+	// the 500 a recovered panic produces are all rendered by a browser and all
+	// want the same headers as a 200. Nothing here reads the body or the route,
+	// so being first costs four header writes.
+	if !cfg.DisableSecurityHeaders {
+		e.Use(securityHeaders(hstsMaxAge, cfg.HstsIncludeSubdomains))
+	}
+
+	// CORS, and its position is deliberate: outside every middleware that can
+	// refuse a request. A cross-origin response without Access-Control-Allow-Origin
+	// is not an error a browser can report — the status, the body and the reason
+	// are all withheld from the script that asked, which sees only "CORS
+	// error". Registered below the body limit, as it was, a browser upload over
+	// the 10M limit would get exactly that: the real 413 arrives with no CORS
+	// headers on it and the caller is left debugging the wrong problem. Above
+	// it, the browser is told it was too large.
+	//
+	// The cost is that a preflight, which this middleware answers itself, no
+	// longer reaches the access log below. That is the same trade the probe
+	// paths make, and preflights are now cached for HTTP_CORS_MAX_AGE anyway.
+	e.Use(corsMiddleware(allowedOrigins, cfg.allowedHeaders(), corsMaxAge))
+
 	e.Use(middleware.BodyLimit(bodyLimit))
-	e.Use(middleware.Recover())
+
+	// The access log, and then the recoverer inside it. That order is the whole
+	// of finding M2: echo's request logger calls next(c) without deferring the
+	// call that writes the entry, so a panic unwinding through it skips the log
+	// entirely. With Recover registered outside — as it was — the panic passed
+	// the logger on its way up and the only record of a 500 was the stack echo's
+	// recoverer prints to stderr, unstructured and nowhere near the injected
+	// logger. Inside, the panic is converted to a response before it reaches the
+	// logger, which sees an ordinary 500 and records it. See requestLogger for
+	// exactly what that entry contains.
 	e.Use(requestLogger(log))
+	e.Use(middleware.Recover())
 
-	// Static content
-	e.Static("/static", "static")
+	// Rate limiting, when a deployment has asked for it. Inside the access log
+	// on purpose: a 429 nobody can see in the log is indistinguishable from a
+	// client that stopped calling, and the whole point of a limit is knowing
+	// when it bites. Outside compression and the request timeout, because a
+	// refused request should not pay for either.
+	if rateLimit.enabled() {
+		e.Use(rateLimiterMiddleware(rateLimit))
+	}
 
-	// CORS
-	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins: cfg.AlllowedOrigins,
-		AllowMethods: []string{
-			http.MethodGet,
-			http.MethodPost,
-			http.MethodPut,
-			http.MethodPatch,
-			http.MethodDelete,
-		},
-	}))
+	// Compression, when a deployment has asked for it. Inside the rate limiter
+	// so a 429 is not compressed, and outside the request timeout so the
+	// handler's writes pass through it.
+	if cfg.Gzip {
+		e.Use(gzipMiddleware(timeoutExempt))
+	}
+
 	// Bound handler execution, when a deployment has asked for a bound. Last
 	// in the chain, so it wraps the handler and nothing else: the access log
 	// above it records the 503 the client was actually sent, and a CORS
@@ -121,6 +212,11 @@ func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
 	if requestTimeout > 0 {
 		e.Use(requestTimeoutMiddleware(requestTimeout, timeoutExempt))
 	}
+
+	// Static content. A route rather than middleware, so where it sits in this
+	// function says nothing about the chain above: echo applies e.Use
+	// middleware to every request when it serves, not when a route is added.
+	e.Static("/static", "static")
 
 	// Hide default echo banner
 	e.HideBanner = true
@@ -174,10 +270,139 @@ func routePath(c echo.Context) string {
 	return c.Request().URL.Path
 }
 
-// skipRequestLog reports whether the request logger should ignore this request.
-func skipRequestLog(c echo.Context) bool {
-	_, skipped := probePaths[routePath(c)]
-	return skipped
+// onProbePath reports whether this request is for one of the liveness or
+// readiness routes. It is the skipper behind three separate decisions — probe
+// traffic is not logged, not rate limited and not compressed — so the set of
+// paths is defined once.
+func onProbePath(c echo.Context) bool {
+	_, matched := probePaths[routePath(c)]
+	return matched
+}
+
+// corsMiddleware builds the CORS middleware from a resolved allowlist.
+//
+// An empty origins list means no cross-origin access, and it has to be said
+// explicitly: echo answers an empty AllowOrigins by substituting []string{"*"},
+// so passing the empty list straight through would turn the closed default back
+// into the wildcard it replaced. AllowOriginFunc takes precedence over
+// AllowOrigins in that middleware, which is what makes the denial airtight
+// whatever echo fills in behind it.
+//
+// AllowCredentials is not set, and there is no setting for it. Without it a
+// cross-origin script can send a request but cannot attach the caller's cookies
+// or read a response that depends on them, which is what keeps even
+// HTTP_ALLLOWED_ORIGINS=* short of handing an authenticated session to any site
+// that asks. Enabling credentials is a decision that belongs with whoever owns
+// the authentication scheme, and it is one wrong pairing — credentials with a
+// wildcard — away from being the CORS misconfiguration everybody writes about.
+func corsMiddleware(origins, headers []string, maxAge int) echo.MiddlewareFunc {
+	config := middleware.CORSConfig{
+		AllowOrigins: origins,
+		AllowHeaders: headers,
+		AllowMethods: []string{
+			http.MethodGet,
+			http.MethodPost,
+			http.MethodPut,
+			http.MethodPatch,
+			http.MethodDelete,
+		},
+		MaxAge: maxAge,
+	}
+
+	if len(origins) == 0 {
+		config.AllowOriginFunc = func(string) (bool, error) { return false, nil }
+	}
+
+	return middleware.CORSWithConfig(config)
+}
+
+// securityHeaders builds the baseline header middleware. hstsMaxAge is in
+// seconds and is zero when no Strict-Transport-Security header should be sent.
+//
+// Content-Security-Policy is deliberately absent. A useful policy names the
+// origins of a particular application's scripts, styles and frames, so this
+// package could only guess; and a CSP that guesses wrong does not fail loudly,
+// it silently stops a page loading half of itself. A consumer serving HTML adds
+// its own with s.Echo().Use.
+//
+// The preload flag is absent for a stronger reason: it is a submission to a list
+// compiled into browsers, it takes months to leave, and no library should be
+// able to put a consumer's domain on it.
+func securityHeaders(hstsMaxAge int, includeSubdomains bool) echo.MiddlewareFunc {
+	return middleware.SecureWithConfig(middleware.SecureConfig{
+		ContentTypeNosniff: secureContentTypeOptions,
+		XFrameOptions:      secureFrameOptions,
+		ReferrerPolicy:     secureReferrerPolicy,
+		XSSProtection:      secureXSSProtection,
+		HSTSMaxAge:         hstsMaxAge,
+		// Echo's flag is the negative one, so this is inverted rather than
+		// forgotten: subdomains are included only when a deployment asked.
+		HSTSExcludeSubdomains: !includeSubdomains,
+		HSTSPreloadEnabled:    false,
+	})
+}
+
+// rateLimiterMiddleware builds the per-client-address rate limiter.
+//
+// The store is echo's in-memory one, with everything that implies and is
+// documented on HttpConfig.RateLimit: the limit is per process, and the map
+// holds a bucket per distinct client address until it has been idle for
+// defaultRateLimitExpiry. The identifier is echo's default, c.RealIP(), which is
+// why HTTP_REAL_IP_SOURCE has to be right before this is worth switching on.
+//
+// Probe paths are exempt. Rate limiting a readiness endpoint withdraws the
+// instance from load balancing and rate limiting a liveness endpoint invites an
+// orchestrator to restart it, so a burst of client traffic would take the
+// process down by way of its own health checks.
+func rateLimiterMiddleware(limit rateLimitSettings) echo.MiddlewareFunc {
+	storeConfig := middleware.RateLimiterMemoryStoreConfig{
+		Burst:     limit.burst,
+		ExpiresIn: defaultRateLimitExpiry,
+	}
+	setRateLimit(&storeConfig.Rate, limit.perSecond)
+
+	return middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
+		Skipper: onProbePath,
+		Store:   middleware.NewRateLimiterMemoryStoreWithConfig(storeConfig),
+	})
+}
+
+// setRateLimit assigns a requests-per-second value to the store's rate field
+// without naming that field's type.
+//
+// The field is a golang.org/x/time/rate.Limit. Converting to it by name would
+// import golang.org/x/time here and promote it from an indirect dependency of
+// echo to a direct one of this module, which changes go.mod — a change CI
+// rejects, and one this package gets nothing for. The type parameter is
+// inferred from the destination, so the conversion happens with no import at
+// all.
+func setRateLimit[T ~float64](dst *T, perSecond float64) {
+	*dst = T(perSecond)
+}
+
+// gzipMiddleware builds the response compressor, skipping the routes where
+// buffering costs more than compression saves.
+//
+// exempt is the timeout exemption list, reused rather than duplicated. A
+// deployment names its streaming, download and upload routes there because they
+// run long, and those are the same routes that must not be buffered and the
+// ones most likely to be carrying media that is already compressed. A second
+// variable listing the same paths would only be a way to get them out of step.
+//
+// Probe paths are skipped too: their bodies are two words, and compressing
+// those makes them bigger while every load balancer in the deployment pays to
+// decompress them.
+func gzipMiddleware(exempt map[string]struct{}) echo.MiddlewareFunc {
+	return middleware.GzipWithConfig(middleware.GzipConfig{
+		MinLength: gzipMinLength,
+		Skipper: func(c echo.Context) bool {
+			if onProbePath(c) {
+				return true
+			}
+			_, skipped := exempt[routePath(c)]
+			return skipped
+		},
+	})
 }
 
 // requestTimeoutMiddleware bounds handler execution at timeout, exempting the
@@ -210,9 +435,19 @@ func requestTimeoutMiddleware(timeout time.Duration, exempt map[string]struct{})
 // requestLogger builds the access log middleware. It emits one structured entry
 // per request through the injected logger, at error level when the handler
 // chain failed or answered with a server error, and at info level otherwise.
+//
+// It is registered outside middleware.Recover, and what a recovered panic looks
+// like here follows from that. Recover handles the error itself — it calls
+// c.Error and returns nil — so by the time this middleware reads its values the
+// panic has already become an ordinary 500 response and next(c) has returned
+// nil. The entry is therefore at error level by the status half of the rule
+// below, v.Status >= 500, and carries no "error" field: there is no error left
+// to report. The panic value and its stack go to stderr through echo's own
+// recoverer and do not reach this logger at all, so an entry with a 500 and no
+// error is the signal to go looking for them.
 func requestLogger(log Logger) echo.MiddlewareFunc {
 	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
-		Skipper: skipRequestLog,
+		Skipper: onProbePath,
 		// Let the global error handler run before the values are read, so the
 		// logged status and response size are the ones the client actually got
 		// rather than the still-untouched defaults.

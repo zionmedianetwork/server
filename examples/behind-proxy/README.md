@@ -28,8 +28,9 @@ come out the same either way.
 
 - `HTTP_REAL_IP_SOURCE=xff` with `HTTP_TRUSTED_PROXIES`, and what changes when
   you set them.
-- A restrictive `HTTP_ALLLOWED_ORIGINS` (three L's — the struct field is
-  misspelled and the variable inherits it) instead of the `*` default.
+- A named `HTTP_ALLLOWED_ORIGINS` (three L's — the struct field is misspelled
+  and the variable inherits it). Unset, **no cross-origin access is allowed at
+  all**; the browser clients a deployment serves have to be named.
 - `HTTP_DEBUG` left off, so handler errors are not narrated to callers.
 - A body limit sized for an API rather than for uploads.
 - Reading the resolved `*server.HttpConfig` back at startup and **warning about
@@ -46,9 +47,12 @@ HTTP_BIND_ADDRESS=127.0.0.1:8080 go run ./examples/behind-proxy
 ```
 
 ```
-WARN  cors allows every origin  {"variable": "HTTP_ALLLOWED_ORIGINS", ...}
 WARN  client address is the peer address and forwarding headers are ignored  {"variable": "HTTP_REAL_IP_SOURCE", ...}
 ```
+
+(There is no CORS warning here any more: with `HTTP_ALLLOWED_ORIGINS` unset the
+server allows no cross-origin access, so there is nothing to warn about. Set it
+to `*` and the `cors allows every origin` line comes back.)
 
 Deployment mode — the load balancer relays the client address and is trusted to:
 
@@ -131,19 +135,27 @@ whose left end is attacker-controlled. Configure the proxy to overwrite.
 
 ## CORS
 
+**With `HTTP_ALLLOWED_ORIGINS` unset, nothing is allowed cross-origin.** Every
+preflight is answered without the header a browser needs, including one from
+your own front end — which is the point: a deployment that has not named its
+browser clients has not been asked to trust anybody.
+
 With `HTTP_ALLLOWED_ORIGINS=https://zion.example`, a preflight from that origin
-is answered with the header a browser needs, and one from anywhere else is not:
+is answered with the headers a browser needs, and one from anywhere else is not:
 
 ```console
 $ curl -s -i -X OPTIONS -H 'Origin: https://zion.example' \
        -H 'Access-Control-Request-Method: GET' http://127.0.0.1:8080/v1/whoami \
-  | grep -iE '^HTTP|access-control-allow-origin'
+  | grep -iE '^HTTP|access-control-'
 HTTP/1.1 204 No Content
+Access-Control-Allow-Headers: Accept,Authorization,Content-Type,X-Request-Id
+Access-Control-Allow-Methods: GET,POST,PUT,PATCH,DELETE
 Access-Control-Allow-Origin: https://zion.example
+Access-Control-Max-Age: 3600
 
 $ curl -s -i -X OPTIONS -H 'Origin: https://evil.example' \
        -H 'Access-Control-Request-Method: GET' http://127.0.0.1:8080/v1/whoami \
-  | grep -iE '^HTTP|access-control-allow-origin'
+  | grep -iE '^HTTP|access-control-'
 HTTP/1.1 204 No Content
 ```
 
@@ -152,5 +164,29 @@ the response, not by the server rejecting the request. The absence of the
 `Access-Control-Allow-Origin` header is the enforcement. curl does not care,
 which is exactly why testing CORS with curl misleads people.
 
-The allowed **methods** are fixed at `GET, POST, PUT, PATCH, DELETE` and are
-not configurable.
+`Access-Control-Max-Age: 3600` is the preflight cache: for the next hour that
+browser skips the OPTIONS round trip for this route. `HTTP_CORS_MAX_AGE` moves
+it, and `HTTP_CORS_MAX_AGE=0` removes the header entirely.
+
+The request headers a preflight allows come from `HTTP_ALLOWED_HEADERS` — one
+L, unlike the origins variable — and default to the four above. The allowed
+**methods** are fixed at `GET, POST, PUT, PATCH, DELETE` and are not
+configurable.
+
+## Security headers
+
+Every response carries them, without any variable being set:
+
+```console
+$ curl -s -i http://127.0.0.1:8080/v1/whoami | grep -iE 'x-content-type|x-frame|referrer|x-xss'
+X-Xss-Protection: 0
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+Referrer-Policy: strict-origin-when-cross-origin
+```
+
+`Strict-Transport-Security` is **not** among them. This process serves h2c in
+the clear, so whether the origin it is reached at is HTTPS everywhere is a fact
+about the load balancer in front, not about this server. Set `HTTP_HSTS_MAX_AGE`
+when it is, and the header is sent for requests the proxy marked with
+`X-Forwarded-Proto: https`.

@@ -112,9 +112,14 @@ func serve(log logam.Logger) error {
 func warnAboutDevelopmentDefaults(cfg *server.HttpConfig, log logam.Logger) {
 	// Note the three L's. The struct field is AlllowedOrigins, so the variable
 	// is HTTP_ALLLOWED_ORIGINS; there is no spelling of this with two.
+	//
+	// The wildcard is no longer the default — an unset variable now allows no
+	// cross-origin access at all — so this warning fires only for a deployment
+	// that asked for it, which is the case worth saying out loud.
 	if slices.Contains(cfg.AlllowedOrigins, "*") {
 		log.Warnw("cors allows every origin",
 			"variable", "HTTP_ALLLOWED_ORIGINS",
+			"effect", "any site can make a cross-origin GET, POST, PUT, PATCH or DELETE to this API",
 			"fix", "name the origins your browser clients are actually served from",
 		)
 	}
