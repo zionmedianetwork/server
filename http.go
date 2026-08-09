@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os/signal"
 	"syscall"
@@ -77,8 +78,36 @@ type httpServer struct {
 // log is the three-method Logger this package writes its access log and its
 // readiness log through. Any logger satisfies it structurally, including
 // github.com/zionmedianetwork/logam's Logger, so callers passing one of those
-// are unaffected by it being named here.
+// are unaffected by it being named here. It is required: a nil one is refused
+// here rather than substituted for.
 func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
+	// The logger first, before the configuration is even read. It is the one
+	// argument this constructor cannot do without, and it is checked here for
+	// the same reason the settings below are: a server that is going to fail
+	// should fail in the call that built it, while the stack still names the
+	// line that made the mistake.
+	//
+	// Refused rather than defaulted to a no-op, and that is the decision worth
+	// stating. This package writes nothing on the caller's behalf and installs
+	// no logger of its own; a silent no-op would leave a service serving
+	// traffic with no access log, and — the part that actually hurts — no
+	// record of a failing readiness check, whose cause is deliberately withheld
+	// from the probe body and exists nowhere else. That service looks healthy
+	// while being unobservable, and nothing anywhere says why. A returned error
+	// is the same answer this constructor gives an unparseable body limit or an
+	// origin that can never match: the mistake is reported once, at the point it
+	// was made.
+	//
+	// This catches a nil interface, which is what `NewHTTP(cfg, nil)` and an
+	// unassigned Logger variable both produce. It cannot catch a non-nil
+	// interface holding a nil pointer — a nil *slog.Logger wrapped in an
+	// adapter — because that is indistinguishable here from an implementation
+	// whose methods handle a nil receiver, and rejecting it would break the
+	// callers for whom it works.
+	if log == nil {
+		return nil, errors.New("logger is nil: this package logs every request and every failing readiness check through the logger it is given and installs no no-op in its place, so a nil one panics on the first request that is logged: pass a server.Logger, such as a three-method adapter over log/slog")
+	}
+
 	var err error
 	if cfg == nil {
 		cfg, err = NewHttpConfig()
@@ -490,6 +519,41 @@ func requestLogger(log Logger) echo.MiddlewareFunc {
 
 func (s httpServer) Echo() *echo.Echo {
 	return s.echo
+}
+
+// Addr reports the address the listener is bound to, and whether there is one.
+//
+// It exists for the case where the configured bind address does not name the
+// port: HTTP_BIND_ADDRESS=":0" asks the kernel to choose, and until now the
+// only way to learn what it chose was to reach through Echo() into echo's
+// listener. That is a test seam and a service-registration seam both — a
+// process that has to announce where it can be reached needs the resolved
+// address, not the one it asked for.
+//
+// The second result is false until the server is listening, which is to say
+// until Run has bound the port. It is a second result rather than a nil
+// net.Addr on its own because that nil is the value that panics on .String()
+// at the call site, one line later, with nothing in the signature to suggest
+// it was possible. Written as
+//
+//	addr, ok := s.Addr()
+//
+// the absent case is at least named, and a caller that discards it has said so.
+//
+// Addr is safe to call from another goroutine while Run is starting up: it
+// reads through echo's own accessor, which takes the lock that startup writes
+// the listener under. Polling it is how a test learns the port without racing
+// the bind.
+//
+// It goes on reporting the address after a drain has finished. Shutdown closes
+// the listener without clearing it, so this answers "what did this server
+// bind", not "is this server still serving" — liveness is at healthzPath.
+func (s httpServer) Addr() (net.Addr, bool) {
+	addr := s.echo.ListenerAddr()
+	if addr == nil {
+		return nil, false
+	}
+	return addr, true
 }
 
 // Run starts the server and blocks until the process is asked to terminate

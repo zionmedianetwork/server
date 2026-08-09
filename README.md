@@ -108,7 +108,11 @@ value with those three methods is accepted, so this parameter does not oblige
 you to adopt a logging library — a `log/slog` adapter is three lines, and a
 `logam.Logger` satisfies it directly. There is no default: the package logs
 through the value it is given, on every request and every readiness probe, and
-installs no no-op in its place. See [Logging](#logging).
+installs no no-op in its place. **A `nil` logger is refused here**, before the
+configuration is even read, rather than substituted for — a no-op stand-in
+would leave a service serving with no access log and no record of a failing
+readiness check, looking healthy while being unobservable. See
+[Logging](#logging).
 
 Everything the configuration decides is resolved and validated here, before
 anything is wired up, so a misconfigured server is reported by this call and
@@ -117,6 +121,7 @@ exit — for:
 
 | Cause | Example message fragment |
 | --- | --- |
+| `log` is nil | `logger is nil: ... panics on the first request that is logged` |
 | `HTTP_MAX_BODY_LIMIT` unparseable or non-positive | `invalid max body limit "10 megs"` |
 | `HTTP_REAL_IP_SOURCE` not `peer` or `xff` | `invalid real ip source "XFF"` |
 | An entry in `HTTP_TRUSTED_PROXIES` that is not CIDR | `invalid trusted proxy "10.1.0.7"` |
@@ -226,6 +231,43 @@ if err := s.Run(); err != nil {
 
 A clean shutdown returns `nil`, so this does not turn an ordinary SIGTERM from
 an orchestrator into a failed exit.
+
+### And one accessor: `s.Addr() (net.Addr, bool)`
+
+The address the listener is actually bound to. It matters when the configured
+one does not name the port:
+
+```go
+go func() { errCh <- s.Run() }()
+
+if addr, ok := s.Addr(); ok {
+	log.Infow("listening", "addr", addr.String())
+}
+```
+
+`HTTP_BIND_ADDRESS=:0` asks the kernel to choose a port, and `BindAddress`
+never learns which one it got — a test, or a process that has to register
+itself somewhere, needs the resolved address rather than the requested one.
+
+| State | Result |
+| --- | --- |
+| Before `Run` has bound a port | `nil, false` |
+| Listening | the listener's address, `true` |
+| After a drain has finished | the address it bound, `true` |
+
+Three things follow from that table:
+
+- **The second result is not decoration.** Before `Run` there is no listener,
+  and a bare `net.Addr` return would hand you the nil interface that panics on
+  `.String()` one line later, with nothing in the signature to warn you. `Run`
+  and `Addr` are on different goroutines by construction, so "not yet" is a
+  state every caller passes through — poll it, or read it after the server has
+  answered something.
+- **It is not a liveness signal.** Shutting down closes the listener without
+  clearing it, so `Addr` keeps answering afterwards. It tells you what this
+  server bound, not whether it is still serving; that is `/healthz`.
+- **It is safe to call while `Run` is starting**, because it reads through
+  Echo's own accessor, which takes the lock startup writes the listener under.
 
 ## Configuration
 
@@ -632,9 +674,10 @@ write JSON. It type-switches on the payload:
 
 | Payload | Status | Body |
 | --- | --- | --- |
-| `server.PostConfirmation` | `201` | the value, unwrapped |
-| `server.PatchConfirmation` | `200` | the value, unwrapped |
-| `server.Confirmation` | `200` | the value, unwrapped |
+| `server.PostConfirmation`, or `*PostConfirmation` | `201` | the value, unwrapped |
+| `server.PatchConfirmation`, or `*PatchConfirmation` | `200` | the value, unwrapped |
+| `server.Confirmation`, or `*Confirmation` | `200` | the value, unwrapped |
+| a **nil** pointer to any of the three | `200` | `{"data":null}` |
 | anything else | `200` | `{"data": <payload>}` |
 
 ```go
@@ -645,33 +688,50 @@ return server.HTTPResponse(c, video{ID: "42", Title: "Episode 42"})
 return server.HTTPResponse(c, server.PostConfirmation{
 	Resource: "video", Message: "created", ID: "42",
 })
-```
 
-Also exported: `server.Singular` and `server.ResponsePayload`, both
-`map[string]interface{}` aliases for building ad-hoc payloads. Adding a new
-confirmation type means adding a case to the switch, otherwise it is silently
-wrapped in `data`.
-
-### Known issue: pointers lose their status code
-
-The type switch matches **value types only**. Passing a pointer falls through
-to the `default` branch, so this:
-
-```go
-return server.HTTPResponse(c, &server.PostConfirmation{ // ← note the &
+// The same 201 and the same body: pointer and value are treated alike.
+return server.HTTPResponse(c, &server.PostConfirmation{
 	Resource: "video", Message: "created", ID: "42",
 })
 ```
 
-answers `200` with `{"data":{"resource":"video","message":"created","id":"42"}}`
-instead of the `201` with an unwrapped body that the value form produces. The
-same applies to `*PatchConfirmation` and `*Confirmation`, which lose their
-unwrapped shape.
+**Pointers used to be a defect here** and are not any more. Until this change
+the type switch matched value types only, so `&server.PostConfirmation{...}`
+fell through to the `default` branch and answered `200` wrapped in `data`
+instead of `201` bare — silently, since nothing at the call site said so. Both
+forms now go through the same cases. If you have code written around the old
+behaviour, see [Responses: what changed](#responses-what-changed) below.
 
-This is a defect, not a design. It is currently **characterised by a test**
-(`TestHTTPResponseCharacterizesPointerConfirmations` in `response_test.go`) so
-that the behaviour is on the record and a fix has to be a deliberate, visible
-change. Until it is fixed: **pass confirmations by value.**
+A **nil** pointer is deliberately not a confirmation: a typed nil carries no
+id, resource or message, so answering `201` with a body of `null` would report
+a creation containing nothing. It takes the envelope instead and comes out
+exactly as an untyped `nil` does — `200 {"data":null}` — rather than
+dereferencing anything in a response path.
+
+Also exported: `server.ResponsePayload`, a `map[string]interface{}` for
+building an ad-hoc payload by hand. (`server.Singular`, an identically defined
+and entirely unused second name for it, was **removed** — replace any use with
+`ResponsePayload`; the underlying type is the same, so nothing but the name
+changes.) Adding a new confirmation type means adding **both** its cases, value
+and pointer, otherwise it is silently wrapped in `data`.
+
+### Responses: what changed
+
+Passing a pointer to a confirmation is the one behaviour change here that a
+consumer can observe without changing a line of their own code:
+
+| Call | Before | Now |
+| --- | --- | --- |
+| `HTTPResponse(c, &PostConfirmation{...})` | `200` `{"data":{...}}` | `201` `{...}` |
+| `HTTPResponse(c, &PatchConfirmation{...})` | `200` `{"data":{...}}` | `200` `{...}` |
+| `HTTPResponse(c, &Confirmation{...})` | `200` `{"data":{...}}` | `200` `{...}` |
+| `HTTPResponse(c, (*PostConfirmation)(nil))` | `200` `{"data":null}` | `200` `{"data":null}` |
+
+This is the intended behaviour arriving late, not a new one: the value forms
+have always answered this way, and any client that was reading `data` out of a
+pointer confirmation was reading a bug. Check clients that parse a creation
+response for a `data` key, and anything asserting `200` on a `POST`. Passing
+the confirmation by value was and remains unaffected.
 
 ## Logging
 
@@ -897,8 +957,6 @@ Everything here is true of the code as it stands. None of it is a plan.
   hardcoded as `e.Static("/static", "static")`, so it serves `./static`
   relative to wherever the binary was started. **`HTTP_STATIC_PATH` is read and
   defaulted but never used** — setting it has no effect at all.
-- **`HTTPResponse` mishandles pointers**, as described in
-  [Known issue](#known-issue-pointers-lose-their-status-code).
 - **No `Content-Security-Policy` and no HSTS by default**, and no metrics or
   tracing instrumentation. See [Security headers](#security-headers) for why
   those two are left to the consumer; add the rest with `s.Echo().Use(...)`, or
