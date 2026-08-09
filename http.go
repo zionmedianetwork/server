@@ -16,6 +16,10 @@ import (
 )
 
 const (
+	// The liveness paths. They answer a static 200 for as long as the process
+	// is serving and say nothing about its dependencies: a liveness probe that
+	// failed with the database would have Kubernetes restart a pod whose only
+	// problem is somewhere else. Readiness is at readyzPath and v1ReadyzPath.
 	healthzPath   = "/healthz"
 	v1HealthzPath = "/v1/healthz"
 
@@ -29,6 +33,10 @@ type httpServer struct {
 	echo   *echo.Echo
 	server *http2.Server
 	logger logam.Logger
+	// readiness is held by pointer so that the value-receiver methods on this
+	// type share one registry: a copy of httpServer must see the checks the
+	// consumer registered on the original, and must not copy the lock.
+	readiness *readinessRegistry
 }
 
 func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
@@ -52,13 +60,24 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 		return nil, err
 	}
 
+	requestTimeout, err := cfg.requestTimeout()
+	if err != nil {
+		return nil, err
+	}
+
+	timeoutExempt, err := cfg.timeoutExemptPaths()
+	if err != nil {
+		return nil, err
+	}
+
 	// Instantiate a new echo
 	e := echo.New()
 
 	s := &httpServer{
-		config: cfg,
-		echo:   e,
-		logger: log,
+		config:    cfg,
+		echo:      e,
+		logger:    log,
+		readiness: &readinessRegistry{},
 	}
 
 	// Where the client address comes from. Left unset, echo falls back to
@@ -88,6 +107,14 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 			http.MethodDelete,
 		},
 	}))
+	// Bound handler execution, when a deployment has asked for a bound. Last
+	// in the chain, so it wraps the handler and nothing else: the access log
+	// above it records the 503 the client was actually sent, and a CORS
+	// preflight is answered without a deadline it has no use for.
+	if requestTimeout > 0 {
+		e.Use(requestTimeoutMiddleware(requestTimeout, timeoutExempt))
+	}
+
 	// Hide default echo banner
 	e.HideBanner = true
 	// Debug decides whether echo's default error handler copies the error a
@@ -99,9 +126,14 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 	e.Server.ReadTimeout = cfg.ReadTimeout
 	e.Server.WriteTimeout = cfg.WriteTimeout
 
-	// Health check routes
+	// Liveness: is this process serving at all. Static, and deliberately so.
 	e.GET(healthzPath, ok)
 	e.GET(v1HealthzPath, ok)
+
+	// Readiness: should this instance be sent traffic. Runs whatever checks
+	// the consumer registered with RegisterReadinessCheck.
+	e.GET(readyzPath, s.readyz)
+	e.GET(v1ReadyzPath, s.readyz)
 
 	s.server = &http2.Server{
 		MaxConcurrentStreams: 200,
@@ -112,23 +144,60 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 	return s, nil
 }
 
-// healthCheckPaths holds the route paths that are excluded from request
-// logging. Probe traffic is high volume and carries no information, so logging
-// it only drowns out real requests.
-var healthCheckPaths = map[string]struct{}{
+// probePaths holds the route paths that are excluded from request logging:
+// the liveness and readiness endpoints. Probe traffic is high volume and
+// carries no information, so logging it only drowns out real requests — and
+// readiness is polled harder than liveness, since a load balancer asks it
+// about every instance.
+var probePaths = map[string]struct{}{
 	healthzPath:   {},
 	v1HealthzPath: {},
+	readyzPath:    {},
+	v1ReadyzPath:  {},
+}
+
+// routePath returns the path a skipper should match on: the pattern the router
+// settled on, so that query strings never affect the decision and a
+// parameterised route is one path rather than one per value. It falls back to
+// the request URL for a request that never matched a route.
+func routePath(c echo.Context) string {
+	if path := c.Path(); path != "" {
+		return path
+	}
+	return c.Request().URL.Path
 }
 
 // skipRequestLog reports whether the request logger should ignore this request.
-// It matches on the routed path so that query strings never affect the decision.
 func skipRequestLog(c echo.Context) bool {
-	path := c.Path()
-	if path == "" {
-		path = c.Request().URL.Path
-	}
-	_, skipped := healthCheckPaths[path]
+	_, skipped := probePaths[routePath(c)]
 	return skipped
+}
+
+// requestTimeoutMiddleware bounds handler execution at timeout, exempting the
+// routes named in exempt.
+//
+// It works by giving c.Request().Context() a deadline, and this is the load
+// bearing caveat: cancellation is a message, not a stop. A handler that selects
+// on its request context, or that passes it down to the database driver and the
+// HTTP clients it calls, is unblocked at the deadline and the caller gets a
+// clean 503. A handler that ignores the context runs to completion exactly as
+// it does today, holding its goroutine and its connection until it finishes;
+// all this middleware adds for that handler is the 503, and only if it happens
+// to return the expired context's error. Propagating c.Request().Context() into
+// every blocking call is what makes the timeout real.
+//
+// The deprecated middleware.Timeout is not used here on purpose: it runs the
+// handler on another goroutine and answers on its behalf, which leaves the
+// handler running anyway, races the response writer, and defeats the Recover
+// middleware.
+func requestTimeoutMiddleware(timeout time.Duration, exempt map[string]struct{}) echo.MiddlewareFunc {
+	return middleware.ContextTimeoutWithConfig(middleware.ContextTimeoutConfig{
+		Timeout: timeout,
+		Skipper: func(c echo.Context) bool {
+			_, skipped := exempt[routePath(c)]
+			return skipped
+		},
+	})
 }
 
 // requestLogger builds the access log middleware. It emits one structured entry
@@ -266,6 +335,9 @@ func (s httpServer) shutdownTimeout() time.Duration {
 	return s.config.ShutdownTimeout
 }
 
+// ok is the liveness handler. It reports that this process is running and
+// answering, and nothing else — a dependency it cannot reach is readiness's
+// business, at readyzPath.
 func ok(ctx echo.Context) error {
 	return ctx.String(http.StatusOK, http.StatusText(http.StatusOK))
 }

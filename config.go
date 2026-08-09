@@ -16,6 +16,15 @@ const (
 	defaultWriteTimeout    = time.Second * 15
 	defaultShutdownTimeout = time.Second * 10
 	defaultStaticPath      = "/static"
+	// defaultReadinessTimeout bounds one readiness probe: every registered
+	// check shares it, and a check still running when it expires is reported
+	// as failed. Kept well under the interval a probe is normally polled at,
+	// so a wedged dependency answers 503 rather than leaving the prober to
+	// time out on its own and report nothing.
+	defaultReadinessTimeout = time.Second * 2
+	// defaultRequestTimeout is zero: no request timeout unless a deployment
+	// asks for one. See HttpConfig.RequestTimeout for why the default is off.
+	defaultRequestTimeout = time.Duration(0)
 	// defaultMaxBodyLimit is the largest request body accepted unless a
 	// deployment raises it. The previous default, 51200M, was parsed as 51.2
 	// GB of decimal megabytes: a size no process can buffer, so in practice
@@ -48,6 +57,39 @@ type HttpConfig struct {
 	// finish once a termination signal arrives. Read from
 	// HTTP_SHUTDOWN_TIMEOUT; defaults to defaultShutdownTimeout.
 	ShutdownTimeout time.Duration `split_words:"true"`
+	// RequestTimeout bounds how long a handler may run before the request
+	// context is cancelled and the caller is answered with 503. Read from
+	// HTTP_REQUEST_TIMEOUT; defaults to defaultRequestTimeout, which is zero
+	// and means no timeout.
+	//
+	// The default is off because this package cannot see the routes it will
+	// carry. A blanket timeout is wrong for the traffic this network exists to
+	// serve — large downloads and uploads, and any streaming or SSE route hold
+	// a request open by design — and a library that switched one on at upgrade
+	// time would convert those into 503s without anybody changing a line of
+	// code. Turning it on is one variable; guessing on a consumer's behalf is
+	// not recoverable.
+	//
+	// When set it must be strictly below WriteTimeout, or the connection is
+	// severed before the 503 can be written and the timeout produces a
+	// transport error instead of a response. NewHTTP refuses a value that is
+	// not.
+	RequestTimeout time.Duration `split_words:"true"`
+	// TimeoutExemptPaths lists the routes RequestTimeout does not apply to:
+	// the streaming, download and upload endpoints that are meant to run long.
+	// Read from HTTP_TIMEOUT_EXEMPT_PATHS as a comma-separated list, and inert
+	// while RequestTimeout is zero.
+	//
+	// Entries are matched against the registered route pattern rather than the
+	// request URL, so a parameterised route is named by its pattern
+	// ("/videos/:id/stream", not "/videos/42/stream") and the static route
+	// registered by this package is "/static*". Every entry must start with a
+	// slash; NewHTTP refuses one that does not.
+	TimeoutExemptPaths []string `split_words:"true"`
+	// ReadinessTimeout bounds a single readiness probe, covering all
+	// registered checks together. Read from HTTP_READINESS_TIMEOUT; defaults
+	// to defaultReadinessTimeout. A non-positive value is treated as unset.
+	ReadinessTimeout time.Duration `split_words:"true"`
 	// MaxBodyLimit is the largest request body accepted, written in gommon's
 	// byte notation: 10M, 512K, 4MiB. Read from HTTP_MAX_BODY_LIMIT; defaults
 	// to defaultMaxBodyLimit. An unparseable value is reported by NewHTTP.
@@ -90,6 +132,10 @@ func NewHttpConfig() (*HttpConfig, error) {
 		h.ShutdownTimeout = defaultShutdownTimeout
 	}
 
+	if h.ReadinessTimeout == 0 {
+		h.ReadinessTimeout = defaultReadinessTimeout
+	}
+
 	if h.StaticPath == "" {
 		h.StaticPath = defaultStaticPath
 	}
@@ -129,6 +175,69 @@ func (c *HttpConfig) bodyLimit() (string, error) {
 	}
 
 	return limit, nil
+}
+
+// requestTimeout returns the bound to put on handler execution, having proved
+// the bound can actually produce the response it promises.
+//
+// Zero means the caller never asked for one, which is the package default and
+// leaves handler execution unbounded. A negative value is refused rather than
+// read as "off": it would expire every request context on arrival, and nobody
+// writes a negative duration meaning to disable a feature.
+//
+// A value at or above WriteTimeout is refused too, and this is the whole point
+// of validating here. The middleware answers an expired context by writing 503,
+// but net/http closes the connection the moment WriteTimeout passes, so a
+// request timeout that is not strictly shorter never gets to write anything and
+// the client sees a truncated stream or a reset instead of a status. Such a
+// setting looks configured and does nothing but cancel handlers, which is the
+// least useful half of the feature.
+func (c *HttpConfig) requestTimeout() (time.Duration, error) {
+	timeout := c.RequestTimeout
+	if timeout == 0 {
+		return defaultRequestTimeout, nil
+	}
+	if timeout < 0 {
+		return 0, fmt.Errorf("invalid request timeout %s: want a positive duration, or zero to disable it", timeout)
+	}
+
+	// A server built by hand may carry no write timeout at all, in which case
+	// nothing competes with the middleware and any positive bound works.
+	if c.WriteTimeout > 0 && timeout >= c.WriteTimeout {
+		return 0, fmt.Errorf("request timeout %s must be below the write timeout %s, or the connection is closed before a 503 can be written and the timeout never produces a response: lower HTTP_REQUEST_TIMEOUT or raise HTTP_WRITETIMEOUT", timeout, c.WriteTimeout)
+	}
+
+	return timeout, nil
+}
+
+// timeoutExemptPaths returns the set of route patterns the request timeout
+// leaves alone. Blank entries are dropped, for the same reason they are in
+// trustedProxyRanges: an env var set to the empty string arrives as a
+// one-element list holding it.
+//
+// The list is parsed whatever RequestTimeout is, so a typo is reported when it
+// is introduced rather than when someone later enables the timeout. Unlike
+// trusted proxies with the wrong IP source, exemptions named while the timeout
+// is off are not worth refusing: with no timeout every route is already exempt,
+// so the list overstates nothing.
+func (c *HttpConfig) timeoutExemptPaths() (map[string]struct{}, error) {
+	exempt := make(map[string]struct{}, len(c.TimeoutExemptPaths))
+	for _, entry := range c.TimeoutExemptPaths {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+
+		// Echo reports the routed path with a leading slash in every case, so
+		// an entry without one can never match and would sit there looking
+		// like an exemption that works.
+		if !strings.HasPrefix(entry, "/") {
+			return nil, fmt.Errorf("invalid timeout exempt path %q: want a route pattern beginning with %q, such as %q", entry, "/", "/"+entry)
+		}
+		exempt[entry] = struct{}{}
+	}
+
+	return exempt, nil
 }
 
 // ipExtractor returns the echo.IPExtractor the configured source calls for.

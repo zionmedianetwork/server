@@ -26,14 +26,23 @@ const (
 // drives the shutdown with a plain context instead of a real signal.
 func noopStop() {}
 
-// listenTestServer builds a server whose listener is created up front, so the
-// test knows the address without racing startup and a port collision fails
-// here rather than inside the serve goroutine. It returns the server, its
-// logger, and the base URL to talk to it.
+// listenTestServer builds a server on testConfig whose listener is created up
+// front, so the test knows the address without racing startup and a port
+// collision fails here rather than inside the serve goroutine. It returns the
+// server, its logger, and the base URL to talk to it.
 func listenTestServer(t *testing.T) (*httpServer, *stubLogger, string) {
 	t.Helper()
 
-	s, log := newTestServer(t)
+	return listenTestServerWith(t, testConfig())
+}
+
+// listenTestServerWith is listenTestServer against a config the test chose,
+// for the cases that have to be exercised over a real connection rather than
+// through the in-process handler.
+func listenTestServerWith(t *testing.T, cfg *HttpConfig) (*httpServer, *stubLogger, string) {
+	t.Helper()
+
+	s, log := newTestServerWith(t, cfg)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

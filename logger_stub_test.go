@@ -12,6 +12,7 @@ type logLevel string
 
 const (
 	levelInfo  logLevel = "info"
+	levelWarn  logLevel = "warn"
 	levelError logLevel = "error"
 	// levelFatal records calls the real logam logger would answer by calling
 	// os.Exit(1). The stub records them instead so a test can assert the
@@ -83,7 +84,13 @@ func (l *stubLogger) Errorw(msg string, keysAndValues ...interface{}) {
 	l.record(levelError, msg, keysAndValues...)
 }
 
-func (l *stubLogger) Warnw(msg string, keysAndValues ...interface{})  {}
+// Warnw is recorded because readiness failures are reported there: the cause
+// of a failing check is deliberately kept out of the response body, so the log
+// entry is the only place it exists and a test has to be able to read it.
+func (l *stubLogger) Warnw(msg string, keysAndValues ...interface{}) {
+	l.record(levelWarn, msg, keysAndValues...)
+}
+
 func (l *stubLogger) Debugw(msg string, keysAndValues ...interface{}) {}
 
 // Fatal and Fatalf are recorded rather than ignored: the real logam logger
