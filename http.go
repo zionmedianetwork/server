@@ -40,6 +40,18 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 		}
 	}
 
+	// Resolve everything the configuration decides before any of it is wired
+	// up, so a misconfigured server is reported here and never half-built.
+	bodyLimit, err := cfg.bodyLimit()
+	if err != nil {
+		return nil, err
+	}
+
+	ipExtractor, err := cfg.ipExtractor()
+	if err != nil {
+		return nil, err
+	}
+
 	// Instantiate a new echo
 	e := echo.New()
 
@@ -49,10 +61,16 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 		logger: log,
 	}
 
+	// Where the client address comes from. Left unset, echo falls back to
+	// legacy behaviour and takes X-Forwarded-For from whoever sent it, so
+	// c.RealIP() — and with it every access log line, and any allowlist or
+	// rate limit built on top — would report whatever the caller asked for.
+	e.IPExtractor = ipExtractor
+
 	// Set some useful middlewares
 	e.Pre(middleware.RemoveTrailingSlash())
 	e.Pre(middleware.RequestID())
-	e.Use(middleware.BodyLimit(cfg.MaxBodyLimit))
+	e.Use(middleware.BodyLimit(bodyLimit))
 	e.Use(middleware.Recover())
 	e.Use(requestLogger(log))
 
@@ -72,7 +90,10 @@ func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
 	}))
 	// Hide default echo banner
 	e.HideBanner = true
-	e.Debug = true
+	// Debug decides whether echo's default error handler copies the error a
+	// handler returned into the response body. Off unless a deployment asks
+	// for it, so a driver or filesystem error is not narrated to the caller.
+	e.Debug = cfg.Debug
 
 	// Read/Write timeout
 	e.Server.ReadTimeout = cfg.ReadTimeout
