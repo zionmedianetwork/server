@@ -123,19 +123,23 @@ func awaitRun(t *testing.T, errCh <-chan error) error {
 	}
 }
 
-// wantNoFatal asserts the process would have survived.
-func wantNoFatal(t *testing.T, log *stubLogger) {
-	t.Helper()
-
-	if fatal := log.entriesAt(levelFatal); len(fatal) != 0 {
-		t.Errorf("logger.Fatal called %d time(s), want 0: %+v", len(fatal), fatal)
-	}
-}
-
-// TestRunShutdownIsGracefulAndNotFatal covers C1: http.ErrServerClosed is the
-// success signal Shutdown produces, so it must not reach logger.Fatal (which
-// calls os.Exit(1) in the real logger) and must not surface as an error.
-func TestRunShutdownIsGracefulAndNotFatal(t *testing.T) {
+// TestRunShutdownIsGraceful covers C1: http.ErrServerClosed is the success
+// signal Shutdown produces, and the original defect read it as a failure. It
+// reached logger.Fatal, which calls os.Exit(1) in the real logger, so the
+// process died at the exact moment it was supposed to be draining.
+//
+// That half of C1 is now a property of the type rather than of this test: the
+// package takes a server.Logger, which declares Infow, Warnw and Errorw and no
+// Fatal, so there is no longer a method to reach. Reintroducing the defect
+// would fail to compile.
+//
+// What is still only true by construction, and so is what the assertions below
+// pin down, is that a graceful shutdown is reported as success: run returns nil
+// and writes nothing at error level. Both halves matter to a caller. A non-nil
+// return from an ordinary SIGTERM makes a main() that exits on error report a
+// clean stop as a crash, and a spurious error entry does the same to anything
+// watching the logs.
+func TestRunShutdownIsGraceful(t *testing.T) {
 	s, log, baseURL := listenTestServer(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -150,7 +154,6 @@ func TestRunShutdownIsGracefulAndNotFatal(t *testing.T) {
 	if err := awaitRun(t, errCh); err != nil {
 		t.Errorf("run() error = %v, want nil on a graceful shutdown", err)
 	}
-	wantNoFatal(t, log)
 	if errs := log.entriesAt(levelError); len(errs) != 0 {
 		t.Errorf("logged %d error entries on a clean shutdown, want 0: %+v", len(errs), errs)
 	}
@@ -161,7 +164,7 @@ func TestRunShutdownIsGracefulAndNotFatal(t *testing.T) {
 // the default signal disposition, so a second SIGINT or SIGTERM aborts a stuck
 // drain instead of being swallowed.
 func TestRunStopsSignalHandlingOnceDrainingStarts(t *testing.T) {
-	s, log, baseURL := listenTestServer(t)
+	s, _, baseURL := listenTestServer(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -182,7 +185,6 @@ func TestRunStopsSignalHandlingOnceDrainingStarts(t *testing.T) {
 	if err := awaitRun(t, errCh); err != nil {
 		t.Errorf("run() error = %v, want nil", err)
 	}
-	wantNoFatal(t, log)
 }
 
 // TestRunCompletesInFlightRequestDuringDrain covers the consequence of C1: the
@@ -190,7 +192,7 @@ func TestRunStopsSignalHandlingOnceDrainingStarts(t *testing.T) {
 // requests. The handler is released only after the listener has closed, so the
 // request is provably mid-flight when the drain starts.
 func TestRunCompletesInFlightRequestDuringDrain(t *testing.T) {
-	s, log, baseURL := listenTestServer(t)
+	s, _, baseURL := listenTestServer(t)
 
 	const body = "drained"
 
@@ -255,14 +257,13 @@ func TestRunCompletesInFlightRequestDuringDrain(t *testing.T) {
 	if err := awaitRun(t, errCh); err != nil {
 		t.Errorf("run() error = %v, want nil", err)
 	}
-	wantNoFatal(t, log)
 }
 
 // TestRunReturnsShutdownErrorWhenGracePeriodExpires proves the configured
 // grace period is the one actually applied, and that overrunning it is
 // reported rather than swallowed.
 func TestRunReturnsShutdownErrorWhenGracePeriodExpires(t *testing.T) {
-	s, log, baseURL := listenTestServer(t)
+	s, _, baseURL := listenTestServer(t)
 	s.config.ShutdownTimeout = 50 * time.Millisecond
 
 	started := make(chan struct{})
@@ -301,7 +302,6 @@ func TestRunReturnsShutdownErrorWhenGracePeriodExpires(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("run() error = %v, want it to wrap context.DeadlineExceeded", err)
 	}
-	wantNoFatal(t, log)
 }
 
 // TestRunReportsServeFailure covers the other half of C1: a genuine listen
@@ -323,7 +323,7 @@ func TestRunReportsServeFailure(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, log := newTestServer(t)
+			s, _ := newTestServer(t)
 			s.Echo().HidePort = true
 			s.config.BindAddress = tt.addr
 
@@ -337,7 +337,6 @@ func TestRunReportsServeFailure(t *testing.T) {
 			if !strings.Contains(err.Error(), tt.addr) {
 				t.Errorf("run() error = %v, want it to name the address %q", err, tt.addr)
 			}
-			wantNoFatal(t, log)
 		})
 	}
 }
@@ -374,8 +373,6 @@ func TestRunReturnsServeFailureInsteadOfExiting(t *testing.T) {
 	if !strings.Contains(runErr.Error(), s.config.BindAddress) {
 		t.Errorf("Run() error = %v, want it to name the address %q", runErr, s.config.BindAddress)
 	}
-
-	wantNoFatal(t, log)
 
 	// The returned error is the single report. Logging it here as well would
 	// describe one failure twice for any caller that handles what it is given.
