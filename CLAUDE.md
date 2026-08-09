@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Go **library** (`package server`, module `github.com/zionmedianetwork/server`) consumed by other zionmedianetwork services. There is no `main` package and no tests yet — nothing here runs on its own. Per README it is meant to provide "http and websocket servers"; only the HTTP side exists today.
+A Go **library** (`package server`, module `github.com/zionmedianetwork/server`) consumed by other zionmedianetwork services. The package itself has no `main`, but `examples/` holds four runnable services that double as documentation — they are in the same module, so CI compiles and lints them and they cannot rot.
+
+It serves HTTP only. Despite the repo's history, there is no websocket implementation and the README no longer claims one.
 
 ## Commands
 
@@ -40,9 +42,11 @@ It returns nil on a clean drain, and non-nil on a failed bind or a drain that ov
 
 Internally `Run` is a thin wrapper over `run(ctx, stop) error`, which is the testable seam — tests drive the whole shutdown path with a plain context instead of real signals. `stop()` is called when the drain begins, so a *second* signal takes the default action and aborts a stuck drain.
 
-`/healthz` and `/v1/healthz` are registered internally and are skipped by the request logger, so probe traffic stays out of the log.
+**Probes.** `/healthz` + `/v1/healthz` are liveness (static 200). `/readyz` + `/v1/readyz` are readiness: they run checks registered via `RegisterReadinessCheck(name, func(ctx) error)`, concurrently, bounded by `HTTP_READINESS_TIMEOUT`, and answer 503 if any fails. All four paths are skipped by the request logger. Readiness bodies name the failing check but include its error text only when `HTTP_DEBUG` is set — the cause always goes to the log at warn instead (see `readiness.go`, which logs transitions plus one repeat per minute rather than per probe).
 
-Logging is the `github.com/zionmedianetwork/logam` interface (zap-backed); callers supply it — this package never constructs one. Request logs are emitted through it as structured fields (`Errorw` on error or 5xx, `Infow` otherwise), including the RequestID middleware's id.
+**`logger.go` — the logging contract.** `NewHTTP` takes a `server.Logger`: a three-method interface (`Infow`, `Warnw`, `Errorw`). A `log/slog` adapter is three one-line methods; `logam.Logger` satisfies it as-is, so pre-existing callers compile untouched (enforced by `logam_compat_test.go`). **Do not widen this interface** — in particular never add `Fatal`, which is how defect C1 killed the caller's process mid-drain; keeping it unnameable is what makes that unrepresentable. This package never constructs a logger.
+
+Request logs carry the RequestID middleware's id. The level rule is `Errorw` when `v.Error != nil || status >= 500`, else `Infow` — note the sharp edge: a handler *returning* `echo.NewHTTPError(400, ...)` logs at **error**, because the error is non-nil regardless of status.
 
 **`config.go` — env configuration.** `HttpConfig` is populated by `envconfig` with prefix `http`. Field names drive the env var names, so watch the spellings:
 
@@ -55,6 +59,9 @@ Logging is the `github.com/zionmedianetwork/logam` interface (zap-backed); calle
 - `HTTP_TRUSTED_PROXIES` — comma-separated CIDRs, only meaningful with `xff`. Empty means loopback + private ranges are trusted; **set, the list is exhaustive** and nothing else is. Setting it while the source is `peer` is a startup error, not a no-op.
 - `HTTP_READTIMEOUT` / `HTTP_WRITETIMEOUT` — no `split_words` tag on these two, so they are *not* `HTTP_READ_TIMEOUT`
 - `HTTP_SHUTDOWN_TIMEOUT` — drain grace period (default 10s). Deliberately `split_words`, unlike the two above; don't copy their style for new fields.
+- `HTTP_REQUEST_TIMEOUT` (default `0`, off) — cancels the request context and answers 503. Must be **strictly below** `HTTP_WRITETIMEOUT` or `NewHTTP` refuses to start: above it, the transport cuts the connection before the middleware can write a status. Only helps handlers that respect `c.Request().Context()`; one that ignores it runs to completion. A handler that observes cancellation but returns some *other* error yields 500, not 503.
+- `HTTP_TIMEOUT_EXEMPT_PATHS` — comma-separated route patterns exempt from the above (streaming, uploads). Exact match on the route pattern, not a prefix.
+- `HTTP_READINESS_TIMEOUT` (default `2s`) — bounds one readiness probe across all checks.
 
 Defaults for the timeouts and static path are applied in `NewHttpConfig` after `envconfig.Process`, not via struct tags. `shutdownTimeout()` additionally treats a non-positive value as unset at the point of use, because a hand-built `HttpConfig` would otherwise get a zero grace period and sever every in-flight request.
 
@@ -62,6 +69,11 @@ Defaults for the timeouts and static path are applied in `NewHttpConfig` after `
 
 ## Known rough edges (present in code, fix only if asked)
 
-- `e.Debug = true` is hardcoded in `NewHTTP` regardless of environment.
-- `cfg.StaticPath` is computed but never used — the static route is hardcoded as `e.Static("/static", "static")`.
-- No websocket server despite the README.
+- **`HTTPResponse` drops a 201 when handed a pointer.** The type switch matches values only, so `HTTPResponse(c, &PostConfirmation{...})` falls through to `default` and returns 200 wrapped in `data`. Characterised by `TestHTTPResponseCharacterizesPointerConfirmations`, deliberately not fixed.
+- `cfg.StaticPath` is computed but never used — the static route is hardcoded as `e.Static("/static", "static")`, resolved against the process working directory.
+- CORS defaults to `*` with all mutating methods, and `MaxAge` is unset so browsers re-preflight every request.
+- No TLS path (H2C only), no websocket, no security headers, no rate limiting, no gzip.
+- `httpServer` is returned unexported, so consumers cannot name the type; the middleware stack is fixed at construction.
+- Echo's `⇨ http server started on ...` line bypasses the injected logger — `HideBanner` is set, `HidePort` is not.
+
+The full severity-ranked review lives on the local `docs/http-server-assessment` branch (`ASSESSMENT.md`), which is deliberately **never pushed**. It tracks which findings are resolved and which remain.
