@@ -3,9 +3,11 @@
 `github.com/zionmedianetwork/server` is a small, opinionated wrapper around
 [Echo v4](https://echo.labstack.com/) that gives a Go service an HTTP listener
 with the parts every service needs already wired: structured access logging
-through a logger you inject, a request id, a body limit, panic recovery, CORS,
-liveness and readiness endpoints, an optional request timeout, and a graceful
-shutdown that drains in-flight requests on `SIGINT`/`SIGTERM`.
+through a logger you inject, a request id, a body limit, panic recovery, CORS
+that is closed until you open it, baseline security headers, optional rate
+limiting and compression, liveness and readiness endpoints, an optional request
+timeout, and a graceful shutdown that drains in-flight requests on
+`SIGINT`/`SIGTERM`.
 
 The logger is the only thing it asks you for, and it asks for three methods —
 `Infow`, `Warnw`, `Errorw` — so `log/slog` from the standard library is enough.
@@ -122,6 +124,12 @@ exit — for:
 | `HTTP_REQUEST_TIMEOUT` negative | `want a positive duration, or zero to disable it` |
 | `HTTP_REQUEST_TIMEOUT` at or above `HTTP_WRITETIMEOUT` | `must be below the write timeout 15s` |
 | An entry in `HTTP_TIMEOUT_EXEMPT_PATHS` without a leading `/` | `want a route pattern beginning with "/"` |
+| An entry in `HTTP_ALLLOWED_ORIGINS` that is not a bare origin | `invalid allowed origin "https://app.example.com/"` |
+| `*` in `HTTP_ALLLOWED_ORIGINS` alongside named origins | `allows every origin, so the named ones are never consulted` |
+| `HTTP_CORS_MAX_AGE` or `HTTP_HSTS_MAX_AGE` negative, or under `1s` | `truncates to zero and disables it` |
+| `HTTP_HSTS_MAX_AGE` set while security headers are disabled | `drop HTTP_DISABLE_SECURITY_HEADERS or drop HTTP_HSTS_MAX_AGE` |
+| `HTTP_HSTS_INCLUDE_SUBDOMAINS` with no `HTTP_HSTS_MAX_AGE` | `no Strict-Transport-Security header is sent` |
+| `HTTP_RATE_LIMIT` negative, or `HTTP_RATE_LIMIT_BURST` set without it | `set HTTP_RATE_LIMIT or drop HTTP_RATE_LIMIT_BURST` |
 
 The returned type is unexported. You cannot name it in a variable
 declaration, a struct field or a function signature — hold it in a `:=`
@@ -139,15 +147,44 @@ e.POST("/v1/videos", createVideo)
 ```
 
 The built-in middleware stack is applied in this order and is fixed at
-construction:
+construction. The first entry is the outermost wrapper, so everything below it
+sees the responses — including the rejections — that the ones after it produce:
 
 1. `Pre`: `RemoveTrailingSlash`, `RequestID`
-2. `Use`: `BodyLimit`, `Recover`, request logger, CORS
-3. `Use`: request timeout — only when `HTTP_REQUEST_TIMEOUT` is set
+2. `Use`: security headers — unless `HTTP_DISABLE_SECURITY_HEADERS` is set
+3. `Use`: CORS
+4. `Use`: `BodyLimit`, request logger, `Recover`
+5. `Use`: rate limiter — only when `HTTP_RATE_LIMIT` is set
+6. `Use`: gzip — only when `HTTP_GZIP` is set
+7. `Use`: request timeout — only when `HTTP_REQUEST_TIMEOUT` is set
+
+Three placements are load-bearing. **CORS sits outside everything that can
+refuse a request**, so a `413` from the body limit, a `429` from the rate
+limiter and the `500` from a recovered panic all carry
+`Access-Control-Allow-Origin` — a cross-origin response without it is one the
+browser will not show the script that asked, status and all, so a rejected
+upload would otherwise look like a CORS misconfiguration rather than a file that
+was too big. **The rate limiter sits inside the access log**, so every `429` is
+logged; a limit you cannot see biting is indistinguishable from a client that
+stopped calling. **The access log sits outside `Recover`**, so a panicking
+handler is logged: Echo's request logger builds its entry *after* `next(c)`
+returns and does not defer that, so a panic unwinding through it skips the log
+entirely — with `Recover` outside, as it was until now, a 500 from a panic
+produced no access log line at all. Inside, the panic has become a response
+before the logger sees it.
+
+The cost of the first one: a CORS preflight is answered above the access log, so
+`OPTIONS` requests are not logged. They are cached by the browser for
+`HTTP_CORS_MAX_AGE` anyway.
+
+The cost of the third one is small but worth knowing: `Recover` no longer wraps
+the logger, so a `Logger` implementation that panics is not contained by this
+package. That is a bug in the logger, it can only happen after the response has
+been written, and `net/http` still stops it taking the process down.
 
 You may append your own with `e.Use(...)` or `e.Pre(...)`, but you cannot
 reorder or remove the built-ins, and anything you append with `Use` runs
-*inside* the request timeout.
+*inside* all of them.
 
 Register every route before calling `Run()`: Echo's router is not guarded
 against concurrent registration, so adding a route while the server is serving
@@ -207,7 +244,15 @@ with the prefix `HTTP`. Durations use Go's `time.ParseDuration` syntax
 | `HTTP_TIMEOUT_EXEMPT_PATHS` | `TimeoutExemptPaths` | empty | Route **patterns** the request timeout skips, e.g. `/videos/:id/stream,/uploads`. Each must start with `/`. |
 | `HTTP_READINESS_TIMEOUT` | `ReadinessTimeout` | `2s` | Bound on one readiness probe, covering all checks together. |
 | `HTTP_MAX_BODY_LIMIT` | `MaxBodyLimit` | `10M` | Largest accepted request body, in gommon byte notation (`10M`, `512K`, `4MiB`). `M` is **decimal**: `10M` is 10,000,000 bytes; use `10MiB` for binary. |
-| `HTTP_ALLLOWED_ORIGINS` | `AlllowedOrigins` | `*` | CORS `Access-Control-Allow-Origin` list. Note the spelling. |
+| `HTTP_ALLLOWED_ORIGINS` | `AlllowedOrigins` | **empty** | CORS origin allowlist. Empty allows **no** cross-origin access. Note the spelling. See [CORS](#cors). |
+| `HTTP_ALLOWED_HEADERS` | `AllowedHeaders` | `Accept,Authorization,Content-Type,X-Request-Id` | Request headers a preflight allows. **One L**, unlike the line above. |
+| `HTTP_CORS_MAX_AGE` | `CorsMaxAge` | `1h` | How long a browser may cache a preflight. `0` sends no `Access-Control-Max-Age` at all. |
+| `HTTP_DISABLE_SECURITY_HEADERS` | `DisableSecurityHeaders` | `false` | Turns off the baseline response headers. See [Security headers](#security-headers). |
+| `HTTP_HSTS_MAX_AGE` | `HstsMaxAge` | `0` (off) | `Strict-Transport-Security` lifetime. Only sent for requests that arrived over TLS or carried `X-Forwarded-Proto: https`. |
+| `HTTP_HSTS_INCLUDE_SUBDOMAINS` | `HstsIncludeSubdomains` | `false` | Adds `includeSubdomains`. Inert — and refused — without a max age. |
+| `HTTP_RATE_LIMIT` | `RateLimit` | `0` (off) | Requests per second per client address. See [Rate limiting](#rate-limiting). |
+| `HTTP_RATE_LIMIT_BURST` | `RateLimitBurst` | one second's worth | Requests allowed to arrive at once. Refused while the rate limit is off. |
+| `HTTP_GZIP` | `Gzip` | `false` | Compresses responses over 1 KiB, skipping probe paths and `HTTP_TIMEOUT_EXEMPT_PATHS`. |
 | `HTTP_STATIC_PATH` | `StaticPath` | `/static` | **Currently ignored.** See [Known limitations](#known-limitations). |
 | `HTTP_DEBUG` | `Debug` | `false` | Copies handler errors into response bodies, indents all JSON, and adds the cause to readiness reports. |
 | `HTTP_REAL_IP_SOURCE` | `RealIPSource` | `peer` | `peer` or `xff`. See [Client IP](#client-ip). |
@@ -215,7 +260,9 @@ with the prefix `HTTP`. Durations use Go's `time.ParseDuration` syntax
 
 Not configurable: the HTTP/2 settings (`MaxConcurrentStreams: 200`,
 `MaxReadFrameSize: 1024000`, `IdleTimeout: 10s`), the CORS method list
-(`GET, POST, PUT, PATCH, DELETE`), and the middleware stack.
+(`GET, POST, PUT, PATCH, DELETE`), `Access-Control-Allow-Credentials` (never
+sent — see [CORS](#cors)), the security header *values*, and the middleware
+stack.
 
 ### Two naming gotchas
 
@@ -240,9 +287,14 @@ breaking change to every deployment already setting them.
 
 2. **`HTTP_ALLLOWED_ORIGINS` has three L's.** The struct field is misspelled
    `AlllowedOrigins`, and envconfig derives the variable name from the field.
-   `HTTP_ALLOWED_ORIGINS` does nothing, and the default is `*`, so the mistake
-   fails open rather than loudly. The misspelling is also visible in Go code
-   for anyone building an `HttpConfig` by hand.
+   `HTTP_ALLOWED_ORIGINS` still does nothing at all. What has changed is the
+   consequence: the origin list now defaults to empty, so the typo means *no
+   cross-origin access* rather than *every origin*, and it announces itself the
+   first time a browser calls. Note also its new neighbour
+   `HTTP_ALLOWED_HEADERS`, which has **one** L and is correctly spelled — the
+   two sit next to each other in a config file and are easy to skim past. The
+   misspelling is also visible in Go code for anyone building an `HttpConfig` by
+   hand.
 
 ### Building a config by hand
 
@@ -373,6 +425,9 @@ Note also that exempting a route from the request timeout is not enough on its
 own: the write timeout still applies to it, so a long stream needs
 `HTTP_WRITETIMEOUT` raised as well or the transport cuts it off regardless.
 
+`HTTP_TIMEOUT_EXEMPT_PATHS` has a second effect: those routes are also skipped
+by gzip when `HTTP_GZIP` is on. See [Compression](#compression).
+
 ## Client IP
 
 `HTTP_REAL_IP_SOURCE` decides where `c.RealIP()` reads the client address from,
@@ -405,6 +460,170 @@ error, not a no-op: the ranges would never be consulted, and a silent no-op
 leaves an operator believing a proxy is trusted. `xff` is also only safe when
 the proxy in front **overwrites** rather than appends to an incoming
 `X-Forwarded-For`. See [`examples/behind-proxy`](examples/behind-proxy).
+
+## CORS
+
+**The default allows nothing.** With `HTTP_ALLLOWED_ORIGINS` unset, no origin
+gets `Access-Control-Allow-Origin`, so no browser hands a response from this
+server to a script served from anywhere else.
+
+That is a change. The default used to be `*`, which meant every service that
+never set the variable published every route — `GET`, `POST`, `PUT`, `PATCH`
+and `DELETE` alike — to any page that could get a browser to call it, and
+nothing in that deployment's configuration recorded the decision. **To restore
+the old behaviour exactly, set `HTTP_ALLLOWED_ORIGINS=*`.**
+
+```bash
+HTTP_ALLLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+```
+
+Entries are origins: a scheme and a host, optionally a port, and nothing else.
+`https://app.example.com/` (trailing slash), `app.example.com` (no scheme) and
+`https://app.example.com/videos` (a path) are all refused by `NewHTTP`, because
+none of them can ever equal the `Origin` header a browser sends and each would
+sit in the config looking like an allowance that works. Echo's wildcard host
+patterns are supported: `https://*.example.com`.
+
+Listing `*` alongside named origins is refused too. The wildcard matches first
+and matches everything, so such a list reads as a narrow policy and behaves as
+an open one.
+
+Three more things:
+
+- **Credentials are never allowed.** This package does not send
+  `Access-Control-Allow-Credentials` and has no setting for it, so even
+  `HTTP_ALLLOWED_ORIGINS=*` cannot be used to read a response that depends on
+  the caller's cookies. Enabling credentials belongs with whoever owns the
+  authentication scheme, and credentials-with-a-wildcard is the CORS
+  misconfiguration everybody writes about.
+- **Preflights are cached for an hour.** `Access-Control-Max-Age` was never
+  sent, so browsers re-issued an `OPTIONS` preflight before *every* non-simple
+  cross-origin request. The default is now `1h`: browsers cap this themselves
+  (Chrome at 2 hours, Firefox at 24), so a larger number is silently truncated
+  and buys nothing, while an hour is honoured verbatim everywhere and bounds
+  how long a tightened policy keeps working in an already-open tab.
+  `HTTP_CORS_MAX_AGE=0` restores the old "no header" behaviour.
+- **Request headers are an allowlist.** `AllowHeaders` was unset, which made
+  echo reflect whatever the browser asked for. The default is now
+  `Accept,Authorization,Content-Type,X-Request-Id` — the last one so a browser
+  client can send the correlation id this package logs and echoes back.
+  `HTTP_ALLOWED_HEADERS=*` restores "anything the browser asks for"; note that
+  the fetch standard excludes `Authorization` from that wildcard, so list it by
+  name if you need it.
+
+CORS is enforced by the browser, not by this server: a refused origin still gets
+a normal `200` (or a `204` for a preflight) with the header simply absent.
+Testing it with curl will mislead you.
+
+## Security headers
+
+On by default, on every response including the rejections:
+
+| Header | Value | Why |
+| --- | --- | --- |
+| `X-Content-Type-Options` | `nosniff` | Stops a browser second-guessing a `Content-Type`, which is how an upload or JSON endpoint ends up executing as script. |
+| `X-Frame-Options` | `SAMEORIGIN` | Refuses cross-origin framing. Not `DENY`: this package serves a same-origin static route, and `DENY` would break an embed the deployment owns while adding nothing. |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | The paths here name resources (`/v1/videos/42`); this keeps them out of a third party's `Referer`. |
+| `X-XSS-Protection` | `0` | Deliberate, and not echo's default of `1; mode=block`. The legacy auditor that enables was itself exploitable and is gone from every current browser; `0` is what OWASP now recommends, sent rather than omitted so a browser that still has the auditor does not switch it on itself. |
+
+`HTTP_DISABLE_SECURITY_HEADERS=true` turns all four off and restores the
+previous behaviour exactly.
+
+No `Content-Security-Policy` is set. A useful one names a particular
+application's script, style and frame origins, and a policy that guesses wrong
+does not fail loudly — it silently stops half a page loading. Add your own with
+`s.Echo().Use(...)`.
+
+### HSTS is off by default, and that is deliberate
+
+`Strict-Transport-Security` is not sent unless `HTTP_HSTS_MAX_AGE` is set.
+
+Every other header here describes one response. HSTS is a durable instruction:
+for `max-age` seconds afterwards the browser refuses to speak plaintext to that
+host, and the only way to undo it early is to serve `max-age=0` over working
+HTTPS. This process speaks **h2c with no TLS of its own**, so whether the origin
+it is reached at is HTTPS everywhere is a fact about somebody's ingress that
+this package cannot see. A library that emitted HSTS by default could take a
+hostname offline, on upgrade, for whatever plaintext still depends on it.
+
+When you do set it:
+
+```bash
+HTTP_HSTS_MAX_AGE=2160h              # ninety days; Go durations have no "d"
+HTTP_HSTS_INCLUDE_SUBDOMAINS=true
+```
+
+That is sent as `Strict-Transport-Security: max-age=7776000; includeSubdomains`.
+
+- The header is emitted only for requests that arrived over TLS or carried
+  `X-Forwarded-Proto: https`. Behind a terminating proxy that means **the proxy
+  must set that header, and must be the only thing that can** — the same
+  requirement `HTTP_REAL_IP_SOURCE` documents for `X-Forwarded-For`.
+- `includeSubdomains` is off by default because it is the irreversible part: it
+  pins every name under the domain, including ones this service knows nothing
+  about. It is refused without a max age, since that combination sends no header
+  at all while reading like HSTS is configured.
+- There is no `preload` and there will not be one. That is a submission to a
+  list compiled into browsers, it takes months to leave, and no library should
+  be able to put a consumer's domain on it.
+
+## Rate limiting
+
+Off by default. `HTTP_RATE_LIMIT` is requests per second per client address:
+
+```bash
+HTTP_RATE_LIMIT=20
+HTTP_RATE_LIMIT_BURST=60     # optional; defaults to one second's worth
+```
+
+Over the limit the caller gets `429 Too Many Requests`, and the refusal is in
+the access log like any other response.
+
+Off by default because three of its properties are facts about a deployment that
+this package cannot see:
+
+- **The limiter is per process.** Ten replicas of a service configured at 20
+  req/s enforce 200 req/s in aggregate, and that number changes every time the
+  deployment scales.
+- **The store is in memory.** It holds one bucket per distinct client address,
+  dropped after three idle minutes. Behind a proxy that is a small map; facing
+  the open internet directly it is a function of your attacker's address space.
+- **It is keyed on `c.RealIP()`**, so it inherits `HTTP_REAL_IP_SOURCE`. With
+  the wrong source every caller shares one bucket, or every caller can mint a
+  new one at will — and a limit keyed on a spoofable address is worse than no
+  limit, because it looks like protection. Read [Client IP](#client-ip) before
+  switching this on.
+
+`/healthz`, `/v1/healthz`, `/readyz` and `/v1/readyz` are never rate limited. A
+`429` on readiness withdraws the instance from load balancing and a `429` on
+liveness invites an orchestrator to restart it, which would turn a burst of
+client traffic into an outage by way of the probes.
+
+A burst is derived from the rate when you do not set one — rounded **up**, and
+never zero, because the underlying store treats a zero burst literally and
+refuses everything: `HTTP_RATE_LIMIT=0.5` with no burst would otherwise
+configure an outage. Setting `HTTP_RATE_LIMIT_BURST` while the rate limit is off
+is a startup error rather than a no-op.
+
+## Compression
+
+Off by default. `HTTP_GZIP=true` compresses responses over 1 KiB for clients
+that send `Accept-Encoding: gzip`.
+
+Off by default because this package carries media. Compressing an MP4 or a JPEG
+spends CPU on both ends to produce something no smaller, and compression
+buffers: a streaming or SSE route only keeps streaming because echo's writer
+forces a gzip flush on each `Flush()`, and the proxies in front are under no
+such obligation.
+
+When it is on, two sets of routes are skipped:
+
+- the probe paths, whose bodies are two words and would come out *larger*;
+- **every route named in `HTTP_TIMEOUT_EXEMPT_PATHS`.** That list already names
+  the routes a deployment has declared long-running — the streams, the
+  downloads, the uploads — which is exactly the set compression should stay out
+  of. One list, so the two cannot drift apart. See
+  [`examples/streaming`](examples/streaming).
 
 ## Responses
 
@@ -559,9 +778,27 @@ the same 400 with `c.JSON`/`c.NoContent` and returns `nil` is logged at info:
 
 (abridged: the other fields are as above.)
 
+A panicking handler is logged too, and its entry has a shape of its own worth
+recognising: **status 500, error level, and no `error` field.** `Recover` runs
+inside the logger and handles the recovered panic itself, so by the time the
+entry is built there is no error left to report — the level comes from the
+status, not from the error. The panic value and its stack go to stderr through
+Echo's own recoverer and never reach the injected logger, so a 500 with no
+`error` field is the line that tells you to go and find them.
+
+```json
+{"level":"ERROR","msg":"request","method":"GET","path":"/v1/videos/42","status":500,
+ "bytes_out":36,"request_id":"...","latency":"212.4µs",...}
+```
+
 Liveness and readiness paths (`/healthz`, `/v1/healthz`, `/readyz`,
 `/v1/readyz`) are skipped entirely, matched on the route pattern, so a query
 string or trailing slash does not sneak them back into the log.
+
+CORS preflights are absent too, for a different reason: the CORS middleware
+answers an `OPTIONS` above the logger, which is the placement that lets every
+rejection below it carry CORS headers — see the middleware stack under
+[The consumer flow](#the-consumer-flow).
 
 `Warnw` has exactly one caller: a failing readiness check. That line carries the
 dependency's own error, which the probe response withholds unless `HTTP_DEBUG`
@@ -570,10 +807,12 @@ place the cause is written down. Only transitions are logged, plus a repeat at
 most once a minute while a check stays down, plus one line on recovery — see
 [Health and readiness](#health-and-readiness).
 
-Two things do not go through the injected logger: Echo's own startup line
+Three things do not go through the injected logger: Echo's own startup line
 (`⇨ http server started on :8080`, on stdout — the banner is hidden, the port
-line is not), and Echo's internal logger for the rare case where writing an
-error response itself fails.
+line is not), Echo's internal logger for the rare case where writing an error
+response itself fails, and the `[PANIC RECOVER]` line with the stack trace,
+which `Recover` prints to stderr. The access log records *that* a request
+panicked; the stack is only on stderr.
 
 ## Examples
 
@@ -639,19 +878,31 @@ Everything here is true of the code as it stands. None of it is a plan.
 - **The middleware stack and CORS policy are fixed at construction.** You can
   append middleware through `s.Echo()`, but not reorder or remove the built-in
   chain, and the CORS method list is not configurable.
-- **CORS defaults to `*`.** Every origin is allowed unless
-  `HTTP_ALLLOWED_ORIGINS` (three L's) is set. A deployment serving browser
-  clients should set it.
+- **CORS is closed until you open it.** No origin is allowed unless
+  `HTTP_ALLLOWED_ORIGINS` (three L's) names it. A deployment serving browser
+  clients must set it; `*` is still available and still a decision.
+- **CORS preflights are not in the access log.** The middleware answers them
+  above the logger, which is what lets every rejection below carry CORS headers.
+  A browser's own network panel is where a failing preflight is diagnosed.
+- **A `413` from a declared `Content-Length` is not in the access log either.**
+  `BodyLimit` sits above the logger and refuses that request before calling the
+  rest of the chain, so nothing below it runs. An oversize body with no declared
+  length *is* logged, because the limit is then hit during the handler's read
+  and surfaces as a returned error. The response is correct in both cases —
+  `413`, with CORS and security headers — only the log line differs.
+- **The rate limiter is per process and in memory.** See
+  [Rate limiting](#rate-limiting) — the effective fleet-wide limit is your
+  replica count times the configured one.
 - **Static files come from the process working directory.** The route is
   hardcoded as `e.Static("/static", "static")`, so it serves `./static`
   relative to wherever the binary was started. **`HTTP_STATIC_PATH` is read and
   defaulted but never used** — setting it has no effect at all.
 - **`HTTPResponse` mishandles pointers**, as described in
   [Known issue](#known-issue-pointers-lose-their-status-code).
-- **No security headers** (HSTS, `X-Content-Type-Options`, CSP, frame options),
-  **no rate limiting**, **no gzip/compression**, and no metrics or tracing
-  instrumentation. Add what you need with `s.Echo().Use(...)`, or put it in the
-  proxy in front.
+- **No `Content-Security-Policy` and no HSTS by default**, and no metrics or
+  tracing instrumentation. See [Security headers](#security-headers) for why
+  those two are left to the consumer; add the rest with `s.Echo().Use(...)`, or
+  put it in the proxy in front.
 
 ## License
 
