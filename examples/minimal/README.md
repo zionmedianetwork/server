@@ -53,10 +53,9 @@ so `main` is the only place this program names a logger at all.
   `s.Run()`.
 - **Both response shapes.** `GET /v1/videos/:id` returns an ordinary payload, so
   `HTTPResponse` answers 200 and wraps it as `{"data": ...}`.
-  `POST /v1/videos` returns a `server.PostConfirmation` **by value**, so it
-  answers 201 with the confirmation unwrapped. Passing `&server.PostConfirmation{...}`
-  instead would silently produce 200 wrapped in `data` — a known defect, flagged
-  in a comment at the call site.
+  `POST /v1/videos` returns a `server.PostConfirmation`, so it answers 201 with
+  the confirmation unwrapped. `&server.PostConfirmation{...}` produces the same
+  response; it used not to, which is noted at the call site.
 - **The call site for `Run()`'s error**, which is the thing this example exists
   for. `Run` never logs on your behalf and never exits the process, so a
   `main()` that ends in a bare `s.Run()` exits 0 and says nothing when the bind
@@ -153,7 +152,7 @@ Four things to read out of that:
 
 Press Ctrl-C (or send SIGTERM) and the server drains and exits 0.
 
-## Try the defect
+## Pointers and values are the same response
 
 Change the `POST` handler to pass a pointer:
 
@@ -161,6 +160,13 @@ Change the `POST` handler to pass a pointer:
 return server.HTTPResponse(c, &server.PostConfirmation{...})
 ```
 
-and the same request answers `200` with
-`{"data":{"resource":"video","message":"created","id":"1"}}`. The type switch in
-`response.go` matches value types only. Pass confirmations by value.
+and the request answers `201` with
+`{"resource":"video","message":"created","id":"1"}`, byte for byte what the
+value form produces. That is worth trying precisely because it used to differ:
+the type switch in `response.go` matched value types only, and the pointer form
+came back `200` with the body wrapped in `data`. It now names both forms of all
+three confirmation types.
+
+A *nil* pointer is the one case that is not a confirmation:
+`var c *server.PostConfirmation` answers `200 {"data":null}` rather than
+claiming a creation with an empty body.

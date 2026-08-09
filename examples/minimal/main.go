@@ -146,12 +146,12 @@ func createVideo(c echo.Context) error {
 
 	id := strconv.FormatInt(nextID.Add(1), 10)
 
-	// A VALUE, not &server.PostConfirmation{...}, and that is the whole
-	// difference. HTTPResponse type-switches on the value types only, so a
-	// pointer falls through to the default branch and is answered 200 wrapped
-	// in "data" instead of the 201 this line produces. The defect is
-	// characterised by a test in the package; see "Known issues" in the
-	// repository README.
+	// A value here, but &server.PostConfirmation{...} answers exactly the same
+	// 201 with the same body: HTTPResponse names each confirmation type twice
+	// in its switch, as a value and as a pointer. It did not always — the
+	// pointer form used to fall through to the envelope and answer 200 wrapped
+	// in "data" — so a service still carrying a client written around that is
+	// worth a look. See "Responses" in the repository README.
 	return server.HTTPResponse(c, server.PostConfirmation{
 		Resource: "video",
 		Message:  "created",

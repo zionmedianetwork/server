@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,53 @@ func wantField(t *testing.T, e logEntry, key string, want interface{}) {
 	}
 	if got != want {
 		t.Errorf("field %q = %#v, want %#v", key, got, want)
+	}
+}
+
+// TestNewHTTPRejectsANilLogger covers the guard that turns a nil logger into a
+// construction error instead of a panic on the first request.
+//
+// Without it the constructor is happy to build a server around a nil interface
+// and the mistake surfaces later, somewhere else: in the access log middleware
+// on the first request that is not a probe, or — worse, because it is rarer and
+// arrives in the middle of an incident — in logReadiness on the first check
+// that fails. Both are far from the call that made the mistake, and the
+// readiness one is reached only once a dependency is already down.
+//
+// The nil config case is here too, and its assertion is that the logger is
+// reported rather than whatever the environment happens to hold: the guard runs
+// before the config is read, so the argument the caller got wrong is the one
+// named.
+func TestNewHTTPRejectsANilLogger(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *HttpConfig
+	}{
+		{name: "with an explicit config", cfg: testConfig()},
+		{name: "with a config read from the environment", cfg: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A panic here is a failure in its own right: the whole point of
+			// the guard is that this mistake is reported, not thrown.
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("NewHTTP() panicked with %v, want an error return", r)
+				}
+			}()
+
+			s, err := NewHTTP(tt.cfg, nil)
+			if err == nil {
+				t.Fatal("NewHTTP() error = nil, want a rejection of the nil logger")
+			}
+			if s != nil {
+				t.Errorf("NewHTTP() server = %#v, want nil alongside the error", s)
+			}
+			if !strings.Contains(err.Error(), "logger is nil") {
+				t.Errorf("NewHTTP() error = %v, want it to name the nil logger", err)
+			}
+		})
 	}
 }
 
