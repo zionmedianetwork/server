@@ -168,12 +168,46 @@ jobs:
       # The non-reachable findings are still printed (-show verbose) so they
       # are visible in the log and can be triaged deliberately.
       #
-      # Caveat worth knowing: govulncheck@latest requires a newer Go than this
-      # module targets, so `go run` switches toolchains for its own build and
-      # the standard library it analyses is that newer one, not the 1.23.x used
-      # by the build job. Dependency coverage is unaffected; standard-library
-      # coverage reflects the newer toolchain. This resolves itself when the
-      # module moves off the Go 1.23 line, which is no longer receiving
-      # security fixes.
-      - name: govulncheck
+      # GOTOOLCHAIN=auto is required and is not incidental. setup-go pins
+      # GOTOOLCHAIN=local so a build cannot silently use a Go other than the
+      # pinned one, but govulncheck@latest declares go >= 1.25.0 and so cannot
+      # be built by the 1.23.x toolchain at all: with local pinning the step
+      # fails outright rather than running. Allowing the switch here scopes the
+      # newer toolchain to govulncheck's own build; the build job keeps its pin.
+      - name: govulncheck (dependencies)
+        env:
+          GOTOOLCHAIN: auto
         run: go run golang.org/x/vuln/cmd/govulncheck@latest -show verbose ./...
+
+      # The step above analyses the standard library of the toolchain it ran
+      # under, which is the newer one it just switched to — NOT the go1.23.x
+      # this module targets. So it reports the dependency graph accurately and
+      # says nothing useful about the standard library anyone actually builds
+      # against here.
+      #
+      # This step closes that gap: an older govulncheck that the pinned 1.23.x
+      # can build, run with the toolchain pinned, so the standard library under
+      # analysis is the one in go.mod. It currently reports 24 REACHABLE
+      # vulnerabilities with call traces into this package, e.g. crypto/x509
+      # via StartH2CServer. Every one is fixed in a later Go: 4 within the 1.23
+      # line, 11 in 1.24, 9 in 1.25.
+      #
+      # It is continue-on-error precisely because those 24 cannot be fixed from
+      # this repository — they are fixed by building with a newer Go, which is
+      # a consumer-visible release decision, not a change to this module. A
+      # blocking step here would be red on day one and stay red, and an
+      # always-red gate teaches everyone to ignore the job. Warning keeps the
+      # exposure in the log where the decision can be made from evidence.
+      #
+      # Note that stdlib exposure follows the toolchain that BUILDS a binary,
+      # not go.mod's `go` directive, which is a floor. A consumer already
+      # building with Go 1.25 is unaffected by this list today.
+      #
+      # Remove this step once the module moves off Go 1.23: at that point the
+      # build toolchain and govulncheck's own requirement converge and the
+      # first step covers the standard library on its own.
+      - name: govulncheck (standard library of the pinned toolchain)
+        continue-on-error: true
+        env:
+          GOTOOLCHAIN: local
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
