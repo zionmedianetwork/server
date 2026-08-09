@@ -8,18 +8,19 @@ A Go **library** (`package server`, module `github.com/zionmedianetwork/server`)
 
 ## Commands
 
-`go.sum is not committed` (deleted in commit 64bf61b), so a fresh clone fails to build:
+`go.sum` **is** committed and `go.mod` is tidy, so a fresh clone builds directly — no `go mod tidy` step. (It was missing until PR #3; older guidance saying otherwise is stale, and CI now enforces both.)
 
 ```bash
-go mod tidy      # required first — regenerates go.sum
 go build ./...
 go vet ./...
-gofmt -l .
-go test ./...                          # no tests exist yet
+gofmt -l .                             # must print nothing
+go test ./...
+go test -race ./...                    # several tests are race- and timing-sensitive
 go test -run '^TestName$' ./...        # single test
+golangci-lint run ./...                # config in .golangci.yml
 ```
 
-Note: `go mod tidy` also rewrites `go.mod`, dropping the `// indirect` markers on the four direct deps (echo, envconfig, logam, golang.org/x/net) — the committed `go.mod` marks all deps indirect, which is inaccurate. Expect that diff; don't hand-revert it.
+CI (`.github/workflows/ci.yml`) runs all of the above plus `go mod verify`, a tidy check, a guard that `go.sum` stays tracked, and `govulncheck`. Do not "fix" a CI failure by regenerating `go.mod`/`go.sum` — a tidy diff there means something else is wrong.
 
 ## Architecture
 

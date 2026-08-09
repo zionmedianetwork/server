@@ -1,0 +1,155 @@
+# golangci-lint configuration for github.com/zionmedianetwork/server.
+#
+# The set below is chosen for what this package actually is: a small HTTP
+# server library with no main, whose whole surface is goroutines, contexts,
+# errors and the network edge. It is deliberately not the maximal linter set —
+# every linter here has a reason, and a gate that fires on things nobody
+# intends to fix is a gate people learn to ignore.
+#
+# Local run:  golangci-lint run ./...
+version: "2"
+
+run:
+  # Test files are linted. Most of this package's behaviour is only observable
+  # from its tests, so excluding them would leave two thirds of the code
+  # unchecked. Where a linter is wrong specifically about test code, it is
+  # narrowed under linters.exclusions.rules rather than turned off.
+  tests: true
+  # CI runners are slower and colder than a developer laptop; the default is
+  # not generous enough for a first, uncached run.
+  timeout: 5m
+
+linters:
+  # Start from nothing and name every linter, so the set does not silently
+  # change under us when golangci-lint changes its own defaults.
+  default: none
+  enable:
+    # --- correctness: the non-negotiable core ---------------------------------
+    # errcheck is the reason this file exists. PR #2 changed Run to return an
+    # error and documented that a caller discarding it is choosing to fly
+    # blind; that argument only holds if something actually catches the
+    # discard. This is that something.
+    - errcheck
+    # The same analyzers as `go vet`. Duplicated with the vet step in CI on
+    # purpose: this keeps `golangci-lint run` meaningful on its own locally.
+    - govet
+    - ineffassign
+    # staticcheck in v2 subsumes gosimple and stylecheck: the SA correctness
+    # checks, the S simplifications and the ST conventions in one linter.
+    - staticcheck
+    # Dead code. This package is consumed by other services, so unexported
+    # helpers that no longer have a caller are pure maintenance cost.
+    - unused
+
+    # --- the network edge -----------------------------------------------------
+    # An unclosed http.Response body leaks a connection from the pool. This is
+    # an HTTP package whose tests make real requests over real listeners, so
+    # the failure mode is native to it.
+    - bodyclose
+    # Catches time.Duration * time.Duration, which type-checks and produces
+    # nonsense. The config and the tests are full of duration arithmetic
+    # (15 * time.Second, 4 * testRequestTimeout), which is where this bug lives.
+    - durationcheck
+    # Outbound calls built without a context. This package just gained request
+    # timeouts whose entire premise is that the request context is propagated
+    # into every blocking call; a context-less http.NewRequest in library code
+    # would silently opt out of that. See the test exclusion below.
+    - noctx
+
+    # --- error handling as a contract ----------------------------------------
+    # %v where %w was meant, and errors compared with == instead of errors.Is.
+    # http.go already does the right thing (errors.Is(err, http.ErrServerClosed),
+    # fmt.Errorf with %w); this keeps the next contributor doing it.
+    - errorlint
+
+    # --- security -------------------------------------------------------------
+    # gosec earns its place in a package that terminates untrusted connections
+    # and parses client-supplied headers. It currently reports nothing, so it
+    # costs no noise today.
+    - gosec
+    # Bidirectional-override characters in source ("trojan source"). Zero
+    # findings, zero maintenance, and this module is a dependency of other
+    # services, which is exactly the position that attack targets.
+    - bidichk
+
+    # --- housekeeping ---------------------------------------------------------
+    - copyloopvar
+    - unconvert
+    - wastedassign
+    - unparam
+    # This package's value is disproportionately in its prose: the comments are
+    # the design record. A typo linter is cheap insurance on that.
+    - misspell
+    # t.Helper() in helpers, so a failure is reported at the assertion's caller
+    # rather than inside a helper. The test suite already does this everywhere
+    # by hand; this stops it decaying.
+    - thelper
+    # os.Setenv / os.MkdirTemp where t.Setenv / t.TempDir belong. The env-driven
+    # config tests depend on t.Setenv's automatic restore for isolation.
+    - usetesting
+    # Any //nolint added later must name the linter and say why. Suppressions
+    # are fine; anonymous suppressions are not.
+    - nolintlint
+    - gocritic
+
+  settings:
+    errcheck:
+      # An unchecked type assertion panics. In a library that panic lands in
+      # someone else's process, at request time.
+      check-type-assertions: true
+      # Left at the default (false): `_ = f()` is not an oversight, it is a
+      # deliberate, greppable statement that the error was considered and
+      # discarded. The test suite uses it that way throughout. Turning this on
+      # flagged nine of those and would have pushed people toward hiding the
+      # discard instead of writing it down.
+      check-blank: false
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    generated: lax
+    rules:
+      # noctx is right about library code and wrong about this test suite. The
+      # tests drive a real server over a real loopback listener; net.Listen,
+      # client.Get and httptest.NewRequest are the correct calls there, and
+      # each is already bounded (testClient carries a Timeout, every wait has a
+      # deadline). Scoped to _test.go so noctx still guards the package itself.
+      - path: _test\.go
+        linters:
+          - noctx
+
+      # A deferred Close on a response body or a test listener has nowhere to
+      # report to and nothing to do about a failure. Narrowed to Close in test
+      # files: errcheck still requires every other error in the tests to be
+      # handled or explicitly discarded, and requires all of them in the
+      # package proper.
+      - path: _test\.go
+        linters:
+          - errcheck
+        text: 'Error return value of `[^`]+\.Close` is not checked'
+
+      # ST1012 wants error values named errFoo. debug_test.go's `dsnError` is a
+      # fixture standing in for a leaky driver error, not a sentinel a caller
+      # matches on, and it is referenced ~18 times across two test files and
+      # named in their comments. Excluded here rather than renamed, so this
+      # change stays a CI change. ST1012 remains active for the package proper,
+      # where the naming convention is part of the public contract.
+      - path: _test\.go
+        linters:
+          - staticcheck
+        text: 'ST1012'
+
+issues:
+  # Report everything. The defaults cap output at 50 per linter and 3 per
+  # distinct issue, which turns a full picture into a sample and hides the
+  # scale of a regression.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    # Same check the CI gofmt step makes, so `golangci-lint run` locally and
+    # `golangci-lint fmt` agree with it. The standalone CI step is kept anyway:
+    # formatting should not depend on a third-party action being reachable.
+    - gofmt
