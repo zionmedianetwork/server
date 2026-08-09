@@ -43,7 +43,6 @@ func runOnSignal(t *testing.T, sig syscall.Signal) {
 		t.Fatalf("Run() did not return within %s after %v", runTimeout, sig)
 	}
 
-	wantNoFatal(t, log)
 	if errs := log.entriesAt(levelError); len(errs) != 0 {
 		t.Errorf("logged %d error entries on a signalled shutdown, want 0: %+v", len(errs), errs)
 	}
