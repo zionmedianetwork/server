@@ -3,20 +3,19 @@ package server
 import (
 	"fmt"
 	"sync"
-
-	"github.com/zionmedianetwork/logam"
 )
 
-// logLevel identifies which logam method produced a recorded entry.
+// logLevel identifies which Logger method produced a recorded entry.
 type logLevel string
 
 const (
 	levelInfo  logLevel = "info"
 	levelWarn  logLevel = "warn"
 	levelError logLevel = "error"
-	// levelFatal records calls the real logam logger would answer by calling
-	// os.Exit(1). The stub records them instead so a test can assert the
-	// process would have survived.
+	// levelFatal records a Fatal call, which the real logam logger answers by
+	// calling os.Exit(1). The stub records it instead so a test can assert the
+	// process would have survived. Nothing in this package can reach it through
+	// server.Logger, which has no Fatal — see the assertion below.
 	levelFatal logLevel = "fatal"
 )
 
@@ -33,15 +32,30 @@ func (e logEntry) field(key string) (interface{}, bool) {
 	return v, ok
 }
 
-// stubLogger implements logam.Logger and records the structured calls the
-// request logger makes. Only the *w methods are recorded; the rest satisfy the
-// interface and are unused by this package.
+// stubLogger implements Logger and records the structured calls this package
+// makes, so a test can read back what was logged.
 type stubLogger struct {
 	mu      sync.Mutex
 	entries []logEntry
 }
 
-var _ logam.Logger = (*stubLogger)(nil)
+var _ Logger = (*stubLogger)(nil)
+
+// The stub deliberately carries two methods Logger does not, asserted here so
+// that it reads as intent rather than as leftovers from the wider interface
+// this stub used to implement. Fatal and Fatalf are the ways a logger ends the
+// process, and the shutdown tests assert through wantNoFatal that a graceful
+// shutdown never reaches them.
+//
+// Narrowing the injected logger to Logger has already settled that question the
+// stronger way: the package cannot call a method its interface does not
+// declare, so wantNoFatal now checks something the compiler guarantees. The
+// four lines stay because they cost four lines, and because they make that
+// check live again on the day somebody widens Logger.
+var _ interface {
+	Fatal(args ...interface{})
+	Fatalf(format string, args ...interface{})
+} = (*stubLogger)(nil)
 
 func (l *stubLogger) record(level logLevel, msg string, keysAndValues ...interface{}) {
 	fields := make(map[string]interface{}, len(keysAndValues)/2)
@@ -80,10 +94,6 @@ func (l *stubLogger) Infow(msg string, keysAndValues ...interface{}) {
 	l.record(levelInfo, msg, keysAndValues...)
 }
 
-func (l *stubLogger) Errorw(msg string, keysAndValues ...interface{}) {
-	l.record(levelError, msg, keysAndValues...)
-}
-
 // Warnw is recorded because readiness failures are reported there: the cause
 // of a failing check is deliberately kept out of the response body, so the log
 // entry is the only place it exists and a test has to be able to read it.
@@ -91,11 +101,10 @@ func (l *stubLogger) Warnw(msg string, keysAndValues ...interface{}) {
 	l.record(levelWarn, msg, keysAndValues...)
 }
 
-func (l *stubLogger) Debugw(msg string, keysAndValues ...interface{}) {}
+func (l *stubLogger) Errorw(msg string, keysAndValues ...interface{}) {
+	l.record(levelError, msg, keysAndValues...)
+}
 
-// Fatal and Fatalf are recorded rather than ignored: the real logam logger
-// exits the process here, so a recorded entry is proof the process would have
-// died.
 func (l *stubLogger) Fatal(args ...interface{}) {
 	l.record(levelFatal, fmt.Sprint(args...))
 }
@@ -103,15 +112,3 @@ func (l *stubLogger) Fatal(args ...interface{}) {
 func (l *stubLogger) Fatalf(format string, args ...interface{}) {
 	l.record(levelFatal, fmt.Sprintf(format, args...))
 }
-
-func (l *stubLogger) Errorf(format string, args ...interface{}) {}
-func (l *stubLogger) Error(args ...interface{})                 {}
-func (l *stubLogger) Infof(format string, args ...interface{})  {}
-func (l *stubLogger) Info(args ...interface{})                  {}
-func (l *stubLogger) Warnf(format string, args ...interface{})  {}
-func (l *stubLogger) Warn(args ...interface{})                  {}
-func (l *stubLogger) Debugf(format string, args ...interface{}) {}
-func (l *stubLogger) Debug(args ...interface{})                 {}
-func (l *stubLogger) Printf(format string, args ...interface{}) {}
-func (l *stubLogger) Print(args ...interface{})                 {}
-func (l *stubLogger) Tracef(format string, args ...interface{}) {}

@@ -11,7 +11,6 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	"github.com/zionmedianetwork/logam"
 	"golang.org/x/net/http2"
 )
 
@@ -32,14 +31,22 @@ type httpServer struct {
 	config *HttpConfig
 	echo   *echo.Echo
 	server *http2.Server
-	logger logam.Logger
+	logger Logger
 	// readiness is held by pointer so that the value-receiver methods on this
 	// type share one registry: a copy of httpServer must see the checks the
 	// consumer registered on the original, and must not copy the lock.
 	readiness *readinessRegistry
 }
 
-func NewHTTP(cfg *HttpConfig, log logam.Logger) (*httpServer, error) {
+// NewHTTP builds a server from cfg, or from the environment when cfg is nil,
+// and returns the first configuration error it finds rather than a half-built
+// server.
+//
+// log is the three-method Logger this package writes its access log and its
+// readiness log through. Any logger satisfies it structurally, including
+// github.com/zionmedianetwork/logam's Logger, so callers passing one of those
+// are unaffected by it being named here.
+func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
 	var err error
 	if cfg == nil {
 		cfg, err = NewHttpConfig()
@@ -201,9 +208,9 @@ func requestTimeoutMiddleware(timeout time.Duration, exempt map[string]struct{})
 }
 
 // requestLogger builds the access log middleware. It emits one structured entry
-// per request through the injected logam logger, at error level when the handler
+// per request through the injected logger, at error level when the handler
 // chain failed or answered with a server error, and at info level otherwise.
-func requestLogger(log logam.Logger) echo.MiddlewareFunc {
+func requestLogger(log Logger) echo.MiddlewareFunc {
 	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 		Skipper: skipRequestLog,
 		// Let the global error handler run before the values are read, so the
