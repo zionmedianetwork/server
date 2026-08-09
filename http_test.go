@@ -13,20 +13,35 @@ import (
 // testRemoteIP is the address net/http/httptest stamps on synthetic requests.
 const testRemoteIP = "192.0.2.1"
 
-// newTestServer builds a server with an explicit config so the tests never
-// depend on the environment, and returns it with the logger it was injected.
-func newTestServer(t *testing.T) (*httpServer, *stubLogger) {
-	t.Helper()
-
-	log := &stubLogger{}
-	cfg := &HttpConfig{
+// testConfig is the explicit config the tests build on, so they never depend
+// on the environment. A test that needs one setting different takes a copy and
+// changes that field rather than restating the whole config.
+func testConfig() *HttpConfig {
+	return &HttpConfig{
 		BindAddress:     ":0",
 		ReadTimeout:     time.Second,
 		WriteTimeout:    time.Second,
 		MaxBodyLimit:    "1M",
 		StaticPath:      defaultStaticPath,
 		AlllowedOrigins: []string{"*"},
+		RealIPSource:    RealIPSourcePeer,
 	}
+}
+
+// newTestServer builds a server on testConfig and returns it with the logger
+// it was injected.
+func newTestServer(t *testing.T) (*httpServer, *stubLogger) {
+	t.Helper()
+
+	return newTestServerWith(t, testConfig())
+}
+
+// newTestServerWith builds a server on the given config, failing the test if
+// the config is one NewHTTP rejects.
+func newTestServerWith(t *testing.T, cfg *HttpConfig) (*httpServer, *stubLogger) {
+	t.Helper()
+
+	log := &stubLogger{}
 
 	s, err := NewHTTP(cfg, log)
 	if err != nil {
@@ -34,6 +49,28 @@ func newTestServer(t *testing.T) (*httpServer, *stubLogger) {
 	}
 
 	return s, log
+}
+
+// newHTTPError runs NewHTTP against a config it is expected to reject and
+// returns the error. A panic escaping the constructor fails the test on its
+// own: middleware.BodyLimit answers a value it cannot parse by panicking, and
+// a constructor that returns an error has to report the mistake rather than
+// take the process down with it. A nil cfg exercises the env-driven path.
+func newHTTPError(t *testing.T, cfg *HttpConfig) error {
+	t.Helper()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("NewHTTP() panicked with %v, want an error return", r)
+		}
+	}()
+
+	if _, err := NewHTTP(cfg, &stubLogger{}); err != nil {
+		return err
+	}
+
+	t.Fatal("NewHTTP() error = nil, want a rejection")
+	return nil
 }
 
 // do runs a request through the full middleware chain without binding a port.
