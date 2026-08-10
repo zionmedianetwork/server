@@ -77,8 +77,31 @@ jobs:
   plan:
     name: plan
     runs-on: ubuntu-latest
+    # contents: write, reluctantly, and only because of one API call.
+    #
+    # This job creates nothing: it computes a version, refuses bad requests
+    # and prints a plan. `contents: read` is what it morally needs, and that
+    # is what it had — until the first real dispatch failed with
+    #
+    #   gh: Resource not accessible by integration (HTTP 403)
+    #
+    # POST /repos/{owner}/{repo}/releases/generate-notes is a preview
+    # endpoint that persists nothing, but GitHub gates it behind write access
+    # to contents all the same, and the REST documentation for it does not say
+    # so. Read access cannot call it.
+    #
+    # The alternatives were worse. Deriving the notes from `git log` instead
+    # would keep this job read-only but break the property the API call exists
+    # for: a dry run printing the exact bytes a real run publishes. Moving
+    # generation into `publish` would mean a dry run could not show the notes
+    # at all, which is most of what a dry run is for.
+    #
+    # What still holds: the `dry-run` job runs with `permissions: {}` — no
+    # token whatsoever — so "a dry run creates nothing" remains enforced by
+    # the token and not by this job being careful. Nothing here pushes, tags
+    # or releases; the only write-scoped call is the notes preview.
     permissions:
-      contents: read
+      contents: write
     outputs:
       current: ${{ steps.version.outputs.current }}
       current_display: ${{ steps.version.outputs.current_display }}
