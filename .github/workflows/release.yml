@@ -333,7 +333,11 @@ jobs:
           fi
           echo "${NEXT} is free."
 
+      # id, because the warm-up step at the end of this job keys off whether the
+      # tag made it to the remote — that, and not the GitHub Release, is what
+      # the module proxy serves.
       - name: Create and push the annotated tag
+        id: tag
         env:
           NEXT: ${{ needs.plan.outputs.next }}
           # Untrusted contributor text (PR titles). Passed as an environment
@@ -421,5 +425,47 @@ jobs:
             echo "go get ${MODULE_PATH}@${NEXT}"
             echo "\`\`\`"
             echo
-            echo "It can take a few minutes for proxy.golang.org and pkg.go.dev to pick it up."
+            echo "The next step asks proxy.golang.org for it, so the command above does not"
+            echo "have to wait for the proxy's own fetch — see the section it adds below."
+            echo "The proxy's version *listing* and pkg.go.dev are refreshed separately and"
+            echo "can lag by minutes; an explicit \`@${NEXT}\` waits for neither."
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Warming the proxy is not a publishing step. The tag pushed above IS the
+      # publication of a Go module — there is nothing to upload — and `go get`
+      # resolves it from that moment on, with or without this. What this changes
+      # is who pays for the first fetch: proxy.golang.org is demand-driven, so
+      # otherwise the first consumer's `go get` waits while the proxy clones the
+      # tag from GitHub, and that consumer is also the first to find out if the
+      # publication is one the proxy cannot resolve. Both move into this run,
+      # seconds after the push, for the cost of one HTTP request.
+      #
+      # Last in the job, after the Release and after the summary, never before.
+      # Everything above is irreversible, and this is a call to a third party
+      # that retries for up to a minute: earlier, it would put a network wait
+      # between `git push` of the tag and `gh release create`, which is the one
+      # window this workflow's concurrency comment exists to keep narrow — a run
+      # cancelled in it leaves a tag with no release. Nothing here can affect
+      # either artefact; both are already final when it runs.
+      #
+      # That it runs only on a real release needs nothing said here: this whole
+      # job is `if: ${{ !inputs.dry_run }}`, and the dry-run job holds no token
+      # at all. The single condition below is that the tag reached the remote.
+      # If `gh release create` failed but the tag is up, the module is published
+      # and is still worth warming, so this keys on the tag step rather than on
+      # the steps between it and here.
+      #
+      # Release candidates are warmed like anything else. `go get @latest` never
+      # selects a prerelease, so this moves nobody's default; but an rc is
+      # precisely the version somebody has been asked to try by explicit
+      # `@vX.Y.Z-rc.N`, and that request resolves through the proxy exactly like
+      # a stable one.
+      #
+      # The script cannot fail this job — that is its documented contract, not a
+      # property of the happy path, and the reasoning is in its header. A failed
+      # warm-up is reported as a workflow annotation and a job summary section.
+      - name: Warm the module proxy
+        if: ${{ !cancelled() && steps.tag.outcome == 'success' }}
+        env:
+          NEXT: ${{ needs.plan.outputs.next }}
+        run: bash .github/scripts/warm-proxy.sh "$NEXT"

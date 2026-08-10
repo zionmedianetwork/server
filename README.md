@@ -971,6 +971,27 @@ tagging (the same workflow, called — not a second copy of the commands), makes
 an **annotated** tag whose message is the release notes, and publishes the
 release with GitHub's generated notes.
 
+The tag *is* the publication — there is nothing to upload, and `go get` resolves
+a version by asking `proxy.golang.org`, which fetches it from GitHub the first
+time anybody asks. The last step of the release job does the asking, so that
+somebody is not a consumer:
+[`.github/scripts/warm-proxy.sh`](.github/scripts/warm-proxy.sh) requests the
+new version's `.info` endpoint — retrying a few times, because the tag is
+seconds old — and checks that what comes back names this version and the commit
+that was just tagged. It runs after the release is published and **cannot fail
+the job**: a warm-up that does not get through leaves things exactly as they
+were before the step existed, with the first `go get` paying for the fetch, so
+it says so in the job summary and stops rather than turning a finished release
+red. It has its own test, which runs offline:
+
+```bash
+bash .github/scripts/warm-proxy-test.sh
+```
+
+The proxy's version *listing* (`@v/list`) and pkg.go.dev refresh on their own
+schedule and can still lag by minutes afterwards. Neither is on the path of an
+explicit `go get github.com/zionmedianetwork/server@vX.Y.Z`.
+
 The one rule worth knowing before pressing it: **Go requires major version 2
 and above to appear in the module path.** Releasing `v2.0.0` means changing
 `module github.com/zionmedianetwork/server` to `.../v2` and updating every
