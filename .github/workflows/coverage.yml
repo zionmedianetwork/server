@@ -1,0 +1,185 @@
+name: Coverage
+
+# Produces the number behind the coverage badge in README.md, using nothing but
+# this repository and GitHub Actions — no Codecov, no Coveralls, no account and
+# no token beyond the one the runner is already given.
+#
+# The mechanism: measure coverage, render a shields.io "endpoint" document
+# (a four-field JSON blob), and commit it to an orphan branch named `badges`.
+# shields.io reads it from raw.githubusercontent.com and draws the badge. The
+# repository is public, so the raw URL needs no credentials.
+#
+# Why a separate workflow rather than a job inside ci.yml:
+#
+#   - ci.yml is a gate and its token is `contents: read` everywhere. Publishing
+#     needs `contents: write`. Keeping them apart means the gate never holds a
+#     token that can write to the repository, and it means ci.yml stays usable
+#     as a reusable workflow from release.yml (a called workflow cannot ask for
+#     more permission than its caller granted).
+#   - This job's failure is not a reason to block a merge. A badge that did not
+#     update is a stale badge, not a broken library.
+on:
+  push:
+    branches: [main]
+  # So the badge can be refreshed without an empty commit — e.g. the first
+  # time, before any push to main has happened.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only the newest commit on main needs a badge; the older run's number is
+# already wrong by the time it finishes.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  coverage:
+    name: measure and publish
+    runs-on: ubuntu-latest
+    permissions:
+      # Only to push the `badges` branch. Nothing here writes to main.
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # Same pin, same reasoning, as ci.yml.
+          go-version: "1.23.x"
+          check-latest: true
+          cache: true
+
+      - name: Measure coverage
+        id: cover
+        run: |
+          set -euo pipefail
+
+          # examples/ is four `package main` programs that exist as runnable
+          # documentation. They have no tests and are not meant to: they are
+          # compiled and linted by CI, which is the whole assertion being made
+          # about them. Including them drags the reported figure from 98.6% to
+          # 70.2% and makes the badge a statement about the wrong thing — a
+          # consumer reading it wants to know how well the *library* is tested.
+          #
+          # This is a deliberate exclusion, so it is spelled out in the job
+          # summary below rather than being silently applied.
+          mapfile -t pkgs < <(go list ./... | grep -v '/examples/')
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "::error::no library packages found to measure"
+            exit 1
+          fi
+          printf 'Measuring: %s\n' "${pkgs[@]}"
+
+          # -count=1 for the same reason ci.yml uses it: a cached PASS is not
+          # evidence, and a cached run produces no profile.
+          go test -count=1 -covermode=atomic \
+            -coverprofile="${RUNNER_TEMP}/coverage.out" "${pkgs[@]}"
+
+          go tool cover -func="${RUNNER_TEMP}/coverage.out" > "${RUNNER_TEMP}/coverage.txt"
+
+          percent="$(awk '/^total:/ { print $3 }' "${RUNNER_TEMP}/coverage.txt")"
+          if [ -z "$percent" ]; then
+            echo "::error::could not read a total from the coverage profile"
+            exit 1
+          fi
+          number="${percent%\%}"
+
+          colour="$(awk -v c="$number" 'BEGIN {
+            if      (c >= 90) print "brightgreen"
+            else if (c >= 80) print "green"
+            else if (c >= 70) print "yellowgreen"
+            else if (c >= 60) print "yellow"
+            else if (c >= 50) print "orange"
+            else              print "red"
+          }')"
+
+          # https://shields.io/badges/endpoint-badge — schemaVersion is the
+          # contract, and it is 1.
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s","color":"%s"}\n' \
+            "$percent" "$colour" > "${RUNNER_TEMP}/coverage.json"
+
+          {
+            echo "percent=${percent}"
+            echo "number=${number}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Coverage: ${percent}"
+            echo
+            echo "Library packages only; \`examples/\` is excluded (four \`package main\`"
+            echo "programs with no tests by design)."
+            echo
+            echo "<details><summary>Per-function breakdown</summary>"
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/coverage.txt"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Only from the default branch. A dispatch against a feature branch still
+      # measures and still reports in the job summary; it just does not move
+      # the badge, which is a statement about main.
+      - name: Publish the badge endpoint to the `badges` branch
+        if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+        env:
+          PERCENT: ${{ steps.cover.outputs.percent }}
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # `badges` is an orphan branch: no shared history with main, one
+          # file, and it never appears in a diff or a bisect of the library.
+          # This is the last step in the job and the checkout is disposable, so
+          # rewriting the working tree here costs nothing.
+          if git fetch --depth=1 origin badges 2>/dev/null; then
+            git checkout -B badges FETCH_HEAD
+          else
+            git checkout --orphan badges
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          fi
+
+          cp "${RUNNER_TEMP}/coverage.json" coverage.json
+          cat > README.md <<'EOF'
+          # badges
+
+          Generated. Do not edit, and do not merge this branch into anything.
+
+          `coverage.json` is a [shields.io endpoint][1] document rewritten by
+          `.github/workflows/coverage.yml` on every push to the default branch.
+          The badge at the top of the real README reads it from
+          raw.githubusercontent.com.
+
+          It covers the library packages only; `examples/` is excluded.
+
+          [1]: https://shields.io/badges/endpoint-badge
+          EOF
+
+          git add coverage.json README.md
+
+          # Nothing to commit when the percentage has not moved, which is the
+          # common case. Committing anyway would add a commit per push to main
+          # for no information.
+          if git diff --cached --quiet; then
+            echo "Coverage is unchanged at ${PERCENT}; nothing to publish."
+            exit 0
+          fi
+
+          git commit -m "coverage: ${PERCENT} (${GITHUB_SHA})"
+
+          # Pushed with GITHUB_TOKEN. Two independent reasons this cannot loop:
+          # a push made with that token does not trigger workflow runs at all,
+          # and this workflow only listens to `branches: [main]` anyway.
+          git push origin badges
+          echo "Published coverage ${PERCENT} to refs/heads/badges."

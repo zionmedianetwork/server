@@ -1,5 +1,12 @@
 # server
 
+[![CI](https://github.com/zionmedianetwork/server/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zionmedianetwork/server/actions/workflows/ci.yml?query=branch%3Amain)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzionmedianetwork%2Fserver%2Fbadges%2Fcoverage.json)](https://github.com/zionmedianetwork/server/actions/workflows/coverage.yml)
+[![Latest release](https://img.shields.io/github/v/release/zionmedianetwork/server?sort=semver&display_name=tag&label=release)](https://github.com/zionmedianetwork/server/releases)
+[![Go reference](https://pkg.go.dev/badge/github.com/zionmedianetwork/server.svg)](https://pkg.go.dev/github.com/zionmedianetwork/server)
+[![Go](https://img.shields.io/github/go-mod/go-version/zionmedianetwork/server?label=go)](go.mod)
+[![License](https://img.shields.io/github/license/zionmedianetwork/server)](LICENSE)
+
 `github.com/zionmedianetwork/server` is a small, opinionated wrapper around
 [Echo v4](https://echo.labstack.com/) that gives a Go service an HTTP listener
 with the parts every service needs already wired: structured access logging
@@ -922,6 +929,60 @@ is wrong; do not "fix" it by regenerating the module files.
 
 Adding a dependency — including for an example — changes `go.mod` and will fail
 that check until the change is committed deliberately.
+
+### Coverage
+
+```bash
+go test -count=1 -covermode=atomic -coverprofile=coverage.out .
+go tool cover -func=coverage.out | tail -1
+go tool cover -html=coverage.out
+```
+
+Note the `.` rather than `./...`: the figure that matters is the library's, and
+`examples/` is four `package main` programs with no tests by design — CI
+compiles and lints them, which is the whole claim being made about them.
+Including them takes the same test run from **98.6%** to 70.2%, which would be
+a number about the wrong thing.
+
+The badge at the top is produced by
+[`.github/workflows/coverage.yml`](.github/workflows/coverage.yml) on every
+push to `main`: it makes the same measurement, renders a shields.io endpoint
+document, and commits it to an orphan `badges` branch that shields reads over
+`raw.githubusercontent.com`. No third-party coverage service, no account and no
+token beyond the workflow's own. If that job has never run — or its branch has
+been deleted — the badge renders as an error rather than a number; it cannot go
+quietly stale, because it has no last-known-good value to fall back to.
+
+## Releasing
+
+`go get` resolves this module by tag, so a release *is* a semver tag plus a
+GitHub Release. Both are made by
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which is
+`workflow_dispatch` only:
+
+| input | |
+|---|---|
+| `release_type` | `patch` / `minor` / `major`, applied to the highest existing semver tag |
+| `prerelease` | cut `vX.Y.Z-rc.N` instead. `go get @latest` never selects a prerelease |
+| `dry_run` | **on by default**: print the plan and the notes, create nothing |
+
+It refuses to run from anywhere but `main`, runs the whole of `ci.yml` before
+tagging (the same workflow, called — not a second copy of the commands), makes
+an **annotated** tag whose message is the release notes, and publishes the
+release with GitHub's generated notes.
+
+The one rule worth knowing before pressing it: **Go requires major version 2
+and above to appear in the module path.** Releasing `v2.0.0` means changing
+`module github.com/zionmedianetwork/server` to `.../v2` and updating every
+import first, in an ordinary reviewed pull request. The workflow checks for
+this and refuses to tag rather than publishing a module that `go get` cannot
+resolve. The version-computation logic lives in
+[`.github/scripts/next-version.sh`](.github/scripts/next-version.sh) and has
+its own table-driven test:
+
+```bash
+bash .github/scripts/next-version-test.sh
+```
 
 ## Known limitations
 
