@@ -10,6 +10,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable as a reusable workflow. .github/workflows/release.yml calls it so
+  # that "the tree is green" means the same checks in the release path as in
+  # the merge path — one definition, no drift. Nothing else changes: this
+  # trigger adds a caller, it does not alter what runs or when.
+  workflow_call:
 
 # The workflow only reads the repository. Nothing here deploys, publishes or
 # comments, so nothing here needs write access to anything.
@@ -17,8 +22,14 @@ permissions:
   contents: read
 
 # A second push to the same branch makes the first run's answer irrelevant.
+#
+# github.event_name is part of the key because of the workflow_call trigger
+# above: a release dispatched while a push to main is still building would
+# otherwise share a group with it, and cancel-in-progress would kill one of the
+# two. They are different questions and must not cancel each other. push and
+# pull_request already differ by ref, so this changes nothing for them.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 # The Go version is written out in each job rather than held in a workflow-level

@@ -1,0 +1,402 @@
+name: Release
+
+# There is nothing to compile and nothing to upload. This is a Go library: a
+# release is a semver git tag that the module proxy can fetch, plus a GitHub
+# Release carrying the notes. Consumers install by tag with `go get`.
+#
+# Which is exactly why this workflow is careful. The only artefact it produces
+# is immutable — once proxy.golang.org has fetched a tag, that tag's contents
+# are fixed forever and deleting it upstream does not undo that. So the order
+# is: decide, verify, then tag; never the other way round.
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Which component to bump (computed from the latest semver tag)"
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+      prerelease:
+        # Kept as a separate boolean rather than a fourth choice ("rc"),
+        # because "rc" on its own does not say a release candidate *of what*.
+        # As a modifier it is unambiguous: minor + prerelease is the first
+        # candidate for the next minor, and running it again yields rc.2.
+        #
+        # It earns its place here specifically because this module is sitting
+        # at v0.0.1 with a v1.0.0 decision in front of it. `go get @latest`
+        # never selects a prerelease, so v1.0.0-rc.1 can be published and
+        # tried by a consumer with an explicit `@v1.0.0-rc.1` without moving
+        # anybody's default. That is not a hypothetical knob; it is the safe
+        # way to make the one irreversible promise this library has left.
+        description: "Cut a release candidate (vX.Y.Z-rc.N) instead of the release itself"
+        type: boolean
+        required: false
+        default: false
+
+      dry_run:
+        # Default true. This form's real output is a permanent, immutable git
+        # tag, so the default answer to "what happens if I just click the
+        # button" has to be "nothing". Cutting a release costs one extra
+        # click; un-cutting one costs a new version number forever.
+        description: "Print what would happen and create nothing (default). Untick to actually release."
+        type: boolean
+        required: false
+        default: true
+
+# Deliberately NOT keyed on github.ref. Two dispatches on the same branch would
+# be computing from the same tag list and would both decide on the same tag;
+# the second would then fail on the duplicate check, or worse, race the first
+# one's push. One release at a time, repository-wide.
+#
+# cancel-in-progress is false: cancelling a run that may be between `git push`
+# of the tag and `gh release create` is how you get a tag with no release.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Read-only by default. Exactly one job below widens this, and it is the only
+# job that can run when dry_run is set.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1. Decide. Cheap, and it runs first so an impossible request (wrong branch,
+  #    v2 on an unsuffixed module path) fails in seconds instead of after the
+  #    full test suite.
+  # --------------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      current: ${{ steps.version.outputs.current }}
+      current_display: ${{ steps.version.outputs.current_display }}
+      next: ${{ steps.version.outputs.next }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      is_v1_commitment: ${{ steps.version.outputs.is_v1_commitment }}
+      module_path: ${{ steps.version.outputs.module_path }}
+      notes: ${{ steps.notes.outputs.body }}
+
+    steps:
+      # workflow_dispatch lets the person clicking the button choose any ref,
+      # including a feature branch or an old tag. A release cut from anything
+      # but the default branch names a commit that is not on the released
+      # line, and no error will ever surface that: `go get` will serve it
+      # happily. This is the first thing checked and it is checked before the
+      # repository is even fetched.
+      - name: Refuse to release from anything but the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Releases are cut from '${DEFAULT_BRANCH}' only. This run was dispatched against '${GITHUB_REF}'."
+            exit 1
+          fi
+          echo "Releasing from ${GITHUB_REF} at ${GITHUB_SHA}."
+
+      - uses: actions/checkout@v7
+        with:
+          # The whole history and every tag: the version is computed from the
+          # tag list, and a shallow clone would hand it an incomplete one.
+          fetch-depth: 0
+
+      # The logic lives in a script rather than inline here so it can be run
+      # and tested outside Actions — see .github/scripts/next-version-test.sh,
+      # which drives it over ~40 cases including the v2 refusal below.
+      - name: Compute the next version
+        id: version
+        # Both inputs are constrained by the form (a fixed choice list and a
+        # boolean), but they still go through env rather than into the script
+        # body: "no `${{ }}` inside a `run:`" is a rule that only works if it
+        # has no exceptions to remember.
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: bash .github/scripts/next-version.sh "$RELEASE_TYPE" "$PRERELEASE"
+
+      # GitHub's own generator rather than a hand-rolled `git log`:
+      #
+      #   - This repository's history is merge commits, one per pull request
+      #     ("Merge pull request #9 from ..."). A `git log --oneline` between
+      #     tags reproduces that noise; the generator resolves each merge to
+      #     the PR title, number, author and link, which is the thing a
+      #     consumer actually reads.
+      #   - Commit subjects here are a mix of conventional-commit prefixes and
+      #     freeform ("add codes"), and nothing enforces the former, so any
+      #     categorisation derived from them would be wrong on the first
+      #     commit that ignores the convention.
+      #   - It also picks up .github/release.yml categorisation if that file
+      #     is ever added, with no change to this workflow.
+      #
+      # It is called through the API here, not via `gh release create
+      # --generate-notes`, so that a dry run can print the exact bytes a real
+      # run would publish. Same call, same inputs, same output.
+      - name: Generate the release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+          PREVIOUS: ${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+
+          args=(--method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes"
+                -f "tag_name=${NEXT}" -f "target_commitish=${GITHUB_SHA}")
+          # Omitted on a first release: there is no previous tag to diff from,
+          # and GitHub then walks back to the start of the history itself.
+          if [ -n "$PREVIOUS" ]; then
+            args+=(-f "previous_tag_name=${PREVIOUS}")
+          fi
+
+          gh api "${args[@]}" --jq .body > "${RUNNER_TEMP}/notes.md"
+
+          # A random delimiter, per GitHub's documented multiline-output form.
+          # The body contains contributor-authored pull request titles, so it
+          # is untrusted text; it is never interpolated into a shell command
+          # anywhere in this workflow, only passed through env and files.
+          delim="NOTES_$(openssl rand -hex 12)"
+          {
+            printf 'body<<%s\n' "$delim"
+            # $(cat) strips trailing newlines and printf puts exactly one back,
+            # so the delimiter always starts its own line. Emitting the file
+            # verbatim would break the block if the API body ever came back
+            # without a trailing newline.
+            printf '%s\n' "$(cat "${RUNNER_TEMP}/notes.md")"
+            printf '%s\n' "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Plan
+        env:
+          CURRENT: ${{ steps.version.outputs.current_display }}
+          NEXT: ${{ steps.version.outputs.next }}
+          IS_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
+          IS_V1: ${{ steps.version.outputs.is_v1_commitment }}
+          MODULE_PATH: ${{ steps.version.outputs.module_path }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "## Release plan — DRY RUN, nothing will be created"
+            else
+              echo "## Release plan — LIVE"
+            fi
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| current version | \`${CURRENT}\` |"
+            echo "| next version | \`${NEXT}\` |"
+            echo "| release type | \`${RELEASE_TYPE}\` |"
+            echo "| prerelease | \`${IS_PRERELEASE}\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| module path | \`${MODULE_PATH}\` |"
+            echo
+
+            if [ "$IS_V1" = "true" ]; then
+              echo "> **This is the v0 → v1.0.0 step.** It is a compatibility commitment:"
+              echo "> after it, a breaking change needs a new major, and a new major needs a"
+              echo "> new module path (\`/v2\`) plus every import updated. Semver allows"
+              echo "> breaking changes in a \`minor\` bump while the library is still v0.x."
+              echo
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Would create an annotated tag \`${NEXT}\` at \`${GITHUB_SHA}\`, push it,"
+              echo "and publish a GitHub Release with these notes:"
+            else
+              echo "Will create an annotated tag \`${NEXT}\` at \`${GITHUB_SHA}\`, push it,"
+              echo "and publish a GitHub Release with these notes:"
+            fi
+            echo
+            echo '---'
+            echo
+            cat "${RUNNER_TEMP}/notes.md"
+            echo
+            echo '---'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # 2. Verify. A release must not be cuttable from a red tree, so this is the
+  #    CI workflow itself — called, not copied. Duplicating the commands here
+  #    would guarantee the two drift, and the release path is precisely where
+  #    the weaker of the two would be the one that runs. ci.yml gained an
+  #    `on: workflow_call:` trigger for this and nothing else.
+  #
+  #    It runs on a dry run too. A dry run that skipped the checks could not
+  #    answer the only question worth asking before a release, which is whether
+  #    this commit is releasable.
+  # --------------------------------------------------------------------------
+  verify:
+    name: verify
+    needs: plan
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # --------------------------------------------------------------------------
+  # 3a. Dry run. Prints and stops. It holds no write permission at all, so
+  #     "creates nothing" is enforced by the token, not by the code being
+  #     careful.
+  # --------------------------------------------------------------------------
+  dry-run:
+    name: dry run (nothing created)
+    needs: [plan, verify]
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Summarise
+        env:
+          CURRENT: ${{ needs.plan.outputs.current_display }}
+          NEXT: ${{ needs.plan.outputs.next }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Dry run complete"
+            echo
+            echo "Verification passed and \`${CURRENT}\` → \`${NEXT}\` is ready to cut."
+            echo
+            echo "**Nothing was created.** No tag, no push, no release."
+            echo "Re-run this workflow with **dry_run unticked** to publish \`${NEXT}\`."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # 3b. The real thing. contents: write is the entire permission set needed —
+  #     it covers both `git push` of the tag and the Releases API. No packages,
+  #     no id-token, no third-party action anywhere in this job: `gh` ships on
+  #     the runner and `git` does the tagging.
+  # --------------------------------------------------------------------------
+  publish:
+    name: tag and release
+    needs: [plan, verify]
+    # Deliberately `!inputs.dry_run` rather than `inputs.dry_run == false`. If
+    # the input ever arrives as the string "false" instead of the boolean, the
+    # negation of a non-empty string is false and this job is skipped — the
+    # failure mode of a surprise is "no release", not "a wrong release".
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The plan job's duplicate check ran against the tags this runner
+      # fetched. This one asks the remote, and it asks immediately before the
+      # push, which closes the window in which somebody else tagged the same
+      # version while the test suite was running.
+      - name: The tag must not already exist on the remote
+        env:
+          NEXT: ${{ needs.plan.outputs.next }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${NEXT}" >/dev/null 2>&1; then
+            echo "::error::${NEXT} already exists on the remote. Tags are immutable once the module proxy has fetched them; pick the next version instead of retagging."
+            exit 1
+          fi
+          echo "${NEXT} is free."
+
+      - name: Create and push the annotated tag
+        env:
+          NEXT: ${{ needs.plan.outputs.next }}
+          # Untrusted contributor text (PR titles). Passed as an environment
+          # variable and written with printf, never interpolated into the
+          # script body.
+          NOTES: ${{ needs.plan.outputs.notes }}
+        run: |
+          set -euo pipefail
+
+          # Annotated, not lightweight: an annotated tag carries an author, a
+          # date and a message, and `git describe` prefers it. The message is
+          # the release notes, so `git show ${NEXT}` answers "what changed"
+          # from a clone, with no network and no GitHub.
+          {
+            printf 'Release %s\n\n' "$NEXT"
+            printf '%s\n' "$NOTES"
+          } > "${RUNNER_TEMP}/tag-message.txt"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # --cleanup=verbatim is load-bearing, not tidiness. git's default
+          # cleanup for a tag message strips every line beginning with '#' as
+          # commentary, and GitHub's generated notes open with a markdown
+          # heading ("## What's Changed") and use '#' headings throughout. The
+          # default silently deletes them from the tag object while leaving the
+          # release on GitHub complete, so the two would disagree and only the
+          # tag would be wrong. Verified: without this flag the heading is gone
+          # from `git show <tag>`.
+          git tag -a "$NEXT" "$GITHUB_SHA" --cleanup=verbatim -F "${RUNNER_TEMP}/tag-message.txt"
+
+          # Pushed with GITHUB_TOKEN, which by design does not trigger further
+          # workflow runs — so this cannot start a release loop. ci.yml does
+          # not listen for tag pushes either.
+          git push origin "refs/tags/${NEXT}"
+          echo "Pushed ${NEXT} -> ${GITHUB_SHA}"
+
+      # From here the tag exists and is public. If this step fails, the tag is
+      # NOT rolled back — deleting a tag the module proxy may already have
+      # fetched does not un-publish it. Recovery is to create the release for
+      # the existing tag by hand:
+      #
+      #   gh release create <tag> --verify-tag --notes "..."
+      #
+      # and not to delete and retag.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ needs.plan.outputs.next }}
+          IS_PRERELEASE: ${{ needs.plan.outputs.is_prerelease }}
+          NOTES: ${{ needs.plan.outputs.notes }}
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "$NOTES" > "${RUNNER_TEMP}/notes.md"
+
+          args=(release create "$NEXT"
+                --verify-tag
+                --title "$NEXT"
+                --notes-file "${RUNNER_TEMP}/notes.md")
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            # Keeps it off "Latest release" and out of `go get @latest`'s way.
+            args+=(--prerelease)
+          else
+            args+=(--latest)
+          fi
+
+          gh "${args[@]}"
+
+      - name: Summarise
+        env:
+          CURRENT: ${{ needs.plan.outputs.current_display }}
+          NEXT: ${{ needs.plan.outputs.next }}
+          MODULE_PATH: ${{ needs.plan.outputs.module_path }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Released \`${NEXT}\`"
+            echo
+            echo "Previous: \`${CURRENT}\`  •  Commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "Tag: <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${NEXT}>"
+            echo
+            echo "\`\`\`"
+            echo "go get ${MODULE_PATH}@${NEXT}"
+            echo "\`\`\`"
+            echo
+            echo "It can take a few minutes for proxy.golang.org and pkg.go.dev to pick it up."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
