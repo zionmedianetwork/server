@@ -136,6 +136,7 @@ exit — for:
 | `HTTP_REQUEST_TIMEOUT` negative | `want a positive duration, or zero to disable it` |
 | `HTTP_REQUEST_TIMEOUT` at or above `HTTP_WRITETIMEOUT` | `must be below the write timeout 15s` |
 | An entry in `HTTP_TIMEOUT_EXEMPT_PATHS` without a leading `/` | `want a route pattern beginning with "/"` |
+| An entry in `HTTP_LOG_EXEMPT_PATHS` without a leading `/` | `invalid log exempt path "health"` |
 | An entry in `HTTP_ALLLOWED_ORIGINS` that is not a bare origin | `invalid allowed origin "https://app.example.com/"` |
 | `*` in `HTTP_ALLLOWED_ORIGINS` alongside named origins | `allows every origin, so the named ones are never consulted` |
 | `HTTP_CORS_MAX_AGE` or `HTTP_HSTS_MAX_AGE` negative, or under `1s` | `truncates to zero and disables it` |
@@ -291,6 +292,7 @@ with the prefix `HTTP`. Durations use Go's `time.ParseDuration` syntax
 | `HTTP_SHUTDOWN_TIMEOUT` | `ShutdownTimeout` | `10s` | Grace period in-flight requests get after a termination signal. |
 | `HTTP_REQUEST_TIMEOUT` | `RequestTimeout` | `0` (off) | Deadline put on the request context. Must be strictly below `HTTP_WRITETIMEOUT`. See [Request timeouts](#request-timeouts). |
 | `HTTP_TIMEOUT_EXEMPT_PATHS` | `TimeoutExemptPaths` | empty | Route **patterns** the request timeout skips, e.g. `/videos/:id/stream,/uploads`. Each must start with `/`. |
+| `HTTP_LOG_EXEMPT_PATHS` | `LogExemptPaths` | empty | Route **patterns** the access log skips, on top of the four probe paths, e.g. your own `/health,/v1/health`. Each must start with `/`. Affects the log and nothing else. See [Keeping your own probes out of the log](#keeping-your-own-probes-out-of-the-log). |
 | `HTTP_READINESS_TIMEOUT` | `ReadinessTimeout` | `2s` | Bound on one readiness probe, covering all checks together. |
 | `HTTP_MAX_BODY_LIMIT` | `MaxBodyLimit` | `10M` | Largest accepted request body, in gommon byte notation (`10M`, `512K`, `4MiB`). `M` is **decimal**: `10M` is 10,000,000 bytes; use `10MiB` for binary. |
 | `HTTP_ALLLOWED_ORIGINS` | `AlllowedOrigins` | **empty** | CORS origin allowlist. Empty allows **no** cross-origin access. Note the spelling. See [CORS](#cors). |
@@ -358,7 +360,10 @@ the package default rather than doing something absurd — but `ReadTimeout` and
 ## Health and readiness
 
 Four routes are registered for you, and all four are excluded from the access
-log — probe traffic is high volume and carries no information.
+log — probe traffic is high volume and carries no information. Note the `z`:
+they are `/healthz` and `/readyz`, not `/health` and `/ready`. If your service
+registers its own probes under different names, see [Keeping your own probes out
+of the log](#keeping-your-own-probes-out-of-the-log).
 
 | Path | Kind | Answers |
 | --- | --- | --- |
@@ -425,6 +430,53 @@ minute while a check stays down, plus one line on recovery.
 
 Kubernetes probes should point at `/healthz` for `livenessProbe` and `/readyz`
 for `readinessProbe` (and `startupProbe`, if you use one).
+
+### Keeping your own probes out of the log
+
+The four routes above are the only ones this package registers, so they are the
+only ones it can skip on its own. A service that registers its own health
+endpoints — `/health`, `/v1/health`, `/status`, `/ping` are the usual
+conventions — gets a log line for every one of them:
+
+```
+/healthz     skipped
+/v1/healthz  skipped
+/readyz      skipped
+/health      logged   <-- yours, and polled just as hard
+/v1/health   logged   <--
+```
+
+`HTTP_LOG_EXEMPT_PATHS` is how you say so. It is a comma-separated list of
+route patterns, added to the built-in four:
+
+```bash
+HTTP_LOG_EXEMPT_PATHS=/health,/v1/health
+```
+
+- **The list is additive, and the built-in four are not removable.** A
+  deployment that sets nothing logs exactly what it logged before; this is not a
+  default, because nothing here registers `/health` and a library that stopped
+  logging a route it does not own — on the strength of the name looking like a
+  probe — would be withholding your traffic from your log on a guess.
+- **Entries are route patterns, matched exactly**, the same as
+  `HTTP_TIMEOUT_EXEMPT_PATHS`: `/v1/videos/:id/health`, not
+  `/v1/videos/42/health`. Exact means exact — `/v1/health` exempts `/v1/health`
+  and does **not** exempt `/v1/healthcheck`. A query string or a trailing slash
+  does not sneak a route back into the log, since the match is on the pattern
+  the router settled on rather than the URL.
+- **An entry without a leading `/` is refused at startup**, because it could
+  never match a routed path and would sit in the config looking like an
+  exemption that works. Blank and padded entries are ignored, so a variable set
+  to the empty string and a list written with spaces both behave.
+- **It applies to the access log and to nothing else.** The built-in probe paths
+  are also exempt from rate limiting and compression; this list is not. See
+  [Rate limiting](#rate-limiting) — a route named here keeps its limit, because
+  a variable named for logging must not be how a route quietly loses the only
+  bound on its traffic.
+
+The cost is the usual one for anything out of the access log: a `429`, a `500`
+or a panic on an exempt route is not logged either. Exempt probes, not routes
+that can fail in interesting ways.
 
 ## Request timeouts
 
@@ -648,6 +700,15 @@ this package cannot see:
 liveness invites an orchestrator to restart it, which would turn a burst of
 client traffic into an outage by way of the probes.
 
+That exemption covers those four paths and no others. **`HTTP_LOG_EXEMPT_PATHS`
+does not extend it**: naming your own `/health` there takes it out of the access
+log and leaves its rate limit exactly where it was. Removing a route's only
+traffic bound is a security decision, and it is not one a variable named for
+logging should be able to make by a side effect nobody reads about. The
+built-in four are the only paths the limiter skips, so if your own probes must
+never be refused, the levers are `HTTP_RATE_LIMIT` itself and the address the
+probers come from — the same ones every other route in the process has.
+
 A burst is derived from the rate when you do not set one — rounded **up**, and
 never zero, because the underlying store treats a zero burst literally and
 refuses everything: `HTTP_RATE_LIMIT=0.5` with no burst would otherwise
@@ -673,6 +734,11 @@ When it is on, two sets of routes are skipped:
   downloads, the uploads — which is exactly the set compression should stay out
   of. One list, so the two cannot drift apart. See
   [`examples/streaming`](examples/streaming).
+
+`HTTP_LOG_EXEMPT_PATHS` is deliberately not a third: it is a logging setting,
+and a probe body of two words is already far below the 1 KiB minimum, so
+consulting it here would change nothing and would blur what that variable
+means.
 
 ## Responses
 
@@ -861,6 +927,15 @@ Echo's own recoverer and never reach the injected logger, so a 500 with no
 Liveness and readiness paths (`/healthz`, `/v1/healthz`, `/readyz`,
 `/v1/readyz`) are skipped entirely, matched on the route pattern, so a query
 string or trailing slash does not sneak them back into the log.
+
+Those four are the ones this package registers. **Your own probes are logged
+unless you name them** — `/health` and `/v1/health` are not `/healthz` and
+`/v1/healthz`, and nothing here guesses that they mean the same thing. Add them
+with `HTTP_LOG_EXEMPT_PATHS=/health,/v1/health`, which extends the skip list
+with route patterns of your own, matched the same exact way. See [Keeping your
+own probes out of the log](#keeping-your-own-probes-out-of-the-log) for the
+rules, and note that the exemption stops at the log: a route named there is
+still rate limited and still compressed.
 
 CORS preflights are absent too, for a different reason: the CORS middleware
 answers an `OPTIONS` above the logger, which is the placement that lets every

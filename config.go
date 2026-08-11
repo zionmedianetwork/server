@@ -112,6 +112,38 @@ type HttpConfig struct {
 	// registered by this package is "/static*". Every entry must start with a
 	// slash; NewHTTP refuses one that does not.
 	TimeoutExemptPaths []string `split_words:"true"`
+	// LogExemptPaths lists further routes the access log leaves alone, on top of
+	// the liveness and readiness paths this package already skips. Read from
+	// HTTP_LOG_EXEMPT_PATHS as a comma-separated list; empty by default, so a
+	// deployment that sets nothing logs exactly what it logged before.
+	//
+	// It exists because the built-in list can only name the routes this package
+	// registers — /healthz, /v1/healthz, /readyz, /v1/readyz. A consumer whose
+	// own probes are at /health, /v1/health, /status or /ping is serving the same
+	// high-volume, information-free traffic through the same access log, and had
+	// no way to say so. Naming them here is that way:
+	//
+	//	HTTP_LOG_EXEMPT_PATHS=/health,/v1/health
+	//
+	// The list is additive and the package's own four paths are not removable.
+	// This is deliberately not a default: nothing here registers /health, and a
+	// library that stopped logging a route it does not own — because the name
+	// looked like a probe — would be withholding a consumer's traffic from their
+	// log on a guess.
+	//
+	// It applies to the access log and to nothing else. The probe paths are also
+	// exempt from rate limiting and compression, and this list is not: a variable
+	// named for logging must not quietly leave a route unlimited, which is a
+	// security decision rather than a logging one. Compression already skips a
+	// two-word probe body on its own, since it is far below the minimum size
+	// worth compressing.
+	//
+	// Entries are matched exactly against the registered route pattern, as
+	// TimeoutExemptPaths is: a parameterised route is named by its pattern
+	// ("/videos/:id/health", not "/videos/42/health"), and "/v1/health" exempts
+	// "/v1/health" alone and not "/v1/healthcheck". Every entry must start with a
+	// slash; NewHTTP refuses one that does not.
+	LogExemptPaths []string `split_words:"true"`
 	// ReadinessTimeout bounds a single readiness probe, covering all
 	// registered checks together. Read from HTTP_READINESS_TIMEOUT; defaults
 	// to defaultReadinessTimeout. A non-positive value is treated as unset.
@@ -411,9 +443,7 @@ func (c *HttpConfig) requestTimeout() (time.Duration, error) {
 }
 
 // timeoutExemptPaths returns the set of route patterns the request timeout
-// leaves alone. Blank entries are dropped, for the same reason they are in
-// trustedProxyRanges: an env var set to the empty string arrives as a
-// one-element list holding it.
+// leaves alone.
 //
 // The list is parsed whatever RequestTimeout is, so a typo is reported when it
 // is introduced rather than when someone later enables the timeout. Unlike
@@ -421,8 +451,27 @@ func (c *HttpConfig) requestTimeout() (time.Duration, error) {
 // is off are not worth refusing: with no timeout every route is already exempt,
 // so the list overstates nothing.
 func (c *HttpConfig) timeoutExemptPaths() (map[string]struct{}, error) {
-	exempt := make(map[string]struct{}, len(c.TimeoutExemptPaths))
-	for _, entry := range c.TimeoutExemptPaths {
+	return exemptPaths(c.TimeoutExemptPaths, "timeout exempt path")
+}
+
+// logExemptPaths returns the set of route patterns the access log leaves alone
+// on top of the probe paths. Empty is the default and means the built-in four
+// and nothing else.
+func (c *HttpConfig) logExemptPaths() (map[string]struct{}, error) {
+	return exemptPaths(c.LogExemptPaths, "log exempt path")
+}
+
+// exemptPaths turns a configured list of route patterns into the set a skipper
+// looks a request up in. kind names the setting in the error, so an operator is
+// told which list holds the offending entry rather than which helper found it.
+//
+// Blank entries are dropped, for the same reason they are in
+// trustedProxyRanges: an env var set to the empty string arrives as a
+// one-element list holding it, and a list written across a config file gains
+// stray spaces.
+func exemptPaths(entries []string, kind string) (map[string]struct{}, error) {
+	exempt := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
@@ -432,7 +481,7 @@ func (c *HttpConfig) timeoutExemptPaths() (map[string]struct{}, error) {
 		// an entry without one can never match and would sit there looking
 		// like an exemption that works.
 		if !strings.HasPrefix(entry, "/") {
-			return nil, fmt.Errorf("invalid timeout exempt path %q: want a route pattern beginning with %q, such as %q", entry, "/", "/"+entry)
+			return nil, fmt.Errorf("invalid %s %q: want a route pattern beginning with %q, such as %q", kind, entry, "/", "/"+entry)
 		}
 		exempt[entry] = struct{}{}
 	}

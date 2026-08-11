@@ -138,6 +138,11 @@ func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
 		return nil, err
 	}
 
+	logExempt, err := cfg.logExemptPaths()
+	if err != nil {
+		return nil, err
+	}
+
 	allowedOrigins, err := cfg.allowedOrigins()
 	if err != nil {
 		return nil, err
@@ -215,7 +220,7 @@ func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
 	// logger. Inside, the panic is converted to a response before it reaches the
 	// logger, which sees an ordinary 500 and records it. See requestLogger for
 	// exactly what that entry contains.
-	e.Use(requestLogger(log))
+	e.Use(requestLogger(log, logExempt))
 	e.Use(middleware.Recover())
 
 	// Rate limiting, when a deployment has asked for it. Inside the access log
@@ -281,6 +286,11 @@ func NewHTTP(cfg *HttpConfig, log Logger) (*httpServer, error) {
 // carries no information, so logging it only drowns out real requests — and
 // readiness is polled harder than liveness, since a load balancer asks it
 // about every instance.
+//
+// It holds the four routes this package registers itself and nothing else. A
+// consumer whose own probes are at /health or /v1/health names them in
+// HTTP_LOG_EXEMPT_PATHS, which the access log adds to this set; guessing at
+// them here would have this package stop logging routes it does not own.
 var probePaths = map[string]struct{}{
 	healthzPath:   {},
 	v1HealthzPath: {},
@@ -306,6 +316,22 @@ func routePath(c echo.Context) string {
 func onProbePath(c echo.Context) bool {
 	_, matched := probePaths[routePath(c)]
 	return matched
+}
+
+// skipProbesAndExempt builds a skipper for the probe paths plus the configured
+// route patterns in exempt. Two middlewares ask exactly this question of two
+// different lists — the access log of HTTP_LOG_EXEMPT_PATHS, the compressor of
+// HTTP_TIMEOUT_EXEMPT_PATHS — and writing the lookup once is what keeps their
+// matching identical: exact, on the pattern the router settled on, so an
+// exemption for "/v1/health" never covers "/v1/healthcheck".
+func skipProbesAndExempt(exempt map[string]struct{}) middleware.Skipper {
+	return func(c echo.Context) bool {
+		if onProbePath(c) {
+			return true
+		}
+		_, skipped := exempt[routePath(c)]
+		return skipped
+	}
 }
 
 // corsMiddleware builds the CORS middleware from a resolved allowlist.
@@ -424,13 +450,7 @@ func setRateLimit[T ~float64](dst *T, perSecond float64) {
 func gzipMiddleware(exempt map[string]struct{}) echo.MiddlewareFunc {
 	return middleware.GzipWithConfig(middleware.GzipConfig{
 		MinLength: gzipMinLength,
-		Skipper: func(c echo.Context) bool {
-			if onProbePath(c) {
-				return true
-			}
-			_, skipped := exempt[routePath(c)]
-			return skipped
-		},
+		Skipper:   skipProbesAndExempt(exempt),
 	})
 }
 
@@ -465,6 +485,14 @@ func requestTimeoutMiddleware(timeout time.Duration, exempt map[string]struct{})
 // per request through the injected logger, at error level when the handler
 // chain failed or answered with a server error, and at info level otherwise.
 //
+// exempt is the configured HTTP_LOG_EXEMPT_PATHS set, skipped alongside the
+// probe paths this package registers. It is how a consumer keeps its own
+// high-volume probes — /health, /v1/health, /status — out of the log: those are
+// routes this package never sees, so the built-in list cannot name them. The
+// exemption stops at the log. A route named here is still rate limited and
+// still compressed, because a variable named for logging must not be the way a
+// route quietly loses its rate limit.
+//
 // It is registered outside middleware.Recover, and what a recovered panic looks
 // like here follows from that. Recover handles the error itself — it calls
 // c.Error and returns nil — so by the time this middleware reads its values the
@@ -474,9 +502,9 @@ func requestTimeoutMiddleware(timeout time.Duration, exempt map[string]struct{})
 // to report. The panic value and its stack go to stderr through echo's own
 // recoverer and do not reach this logger at all, so an entry with a 500 and no
 // error is the signal to go looking for them.
-func requestLogger(log Logger) echo.MiddlewareFunc {
+func requestLogger(log Logger, exempt map[string]struct{}) echo.MiddlewareFunc {
 	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
-		Skipper: onProbePath,
+		Skipper: skipProbesAndExempt(exempt),
 		// Let the global error handler run before the values are read, so the
 		// logged status and response size are the ones the client actually got
 		// rather than the still-untouched defaults.
